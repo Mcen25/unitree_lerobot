@@ -154,9 +154,11 @@ def run_inference(
     # processor returns dict with input_ids, attention_mask, pixel_values
     inputs = processor(prompt, image)
 
-    # Cast all tensor inputs to model dtype (float16 on Jetson)
+    # Float tensors (pixel_values) → model dtype; integer tensors (input_ids) → device only
     inputs = {
-        k: v.to(device, dtype=model.dtype) if hasattr(v, "to") else v
+        k: v.to(device, dtype=model.dtype) if (hasattr(v, "to") and v.is_floating_point())
+        else v.to(device) if hasattr(v, "to")
+        else v
         for k, v in inputs.items()
     }
 
