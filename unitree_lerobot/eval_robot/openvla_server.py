@@ -36,16 +36,11 @@ from PIL import Image
 
 
 # ---------------------------------------------------------------------------
-# OpenVLA prompt template (matches training format)
+# OpenVLA prompt template
 # ---------------------------------------------------------------------------
-SYSTEM_PROMPT = (
-    "A chat between a curious user and an artificial intelligence assistant. "
-    "The assistant gives helpful, detailed, and polite answers to the user's questions."
-)
-
 
 def make_prompt(task: str) -> str:
-    return f"{SYSTEM_PROMPT} USER: What action should the robot take to {task}? ASSISTANT:"
+    return f"In: What action should the robot take to {task}?\nOut:"
 
 
 # ---------------------------------------------------------------------------
