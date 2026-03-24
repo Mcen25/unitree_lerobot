@@ -22,8 +22,10 @@ Usage (robot Jetson NX):
 import argparse
 import base64
 import os
+import threading
 import time
 import traceback
+from multiprocessing import shared_memory
 
 import cv2
 import numpy as np
@@ -35,8 +37,8 @@ import logging_mp
 logging_mp.basic_config(level=logging_mp.INFO)
 logger_mp = logging_mp.get_logger(__name__)
 
-from unitree_lerobot.eval_robot.make_robot import setup_image_client, setup_robot_interface
-from unitree_lerobot.eval_robot.utils.utils import cleanup_resources
+from unitree_lerobot.eval_robot.image_server.image_client import ImageClient
+from unitree_lerobot.eval_robot.make_robot import setup_robot_interface
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +101,10 @@ def parse_args():
                    help="Enable real robot DDS (omit for dry-run)")
     p.add_argument("--motion", action="store_true",
                    help="Use rt/arm_sdk motion topic instead of rt/lowcmd debug topic")
+    p.add_argument("--img-host", default="192.168.123.164",
+                   help="IP of the teleimager-server (image server)")
+    p.add_argument("--img-port", type=int, default=55555,
+                   help="ZMQ PUB port of the teleimager-server")
     args = p.parse_args()
     # setup_robot_interface expects args.sim
     args.sim = not args.send_real_robot
@@ -120,14 +126,25 @@ def main():
     logger_mp.info(f"Connecting to OpenVLA server at {args.server_host}:{args.server_port}")
 
     _SAVED_Q_PATH = "/tmp/eval_openvla_last_q.npy"
-    image_info = None
+    tv_img_shm = None
     arm_ctrl = None
     try:
         # -- Camera ----------------------------------------------------------
-        image_info = setup_image_client(args)
-        tv_img_array = image_info["tv_img_array"]
-        tv_img_shape = image_info["tv_img_shape"]
-        is_binocular = image_info["is_binocular"]
+        # teleimager-server publishes 480×640 single head camera on port 55555
+        tv_img_shape = (480, 640, 3)
+        tv_img_shm = shared_memory.SharedMemory(
+            create=True, size=int(np.prod(tv_img_shape)) * np.uint8().itemsize
+        )
+        tv_img_array = np.ndarray(tv_img_shape, dtype=np.uint8, buffer=tv_img_shm.buf)
+        img_client = ImageClient(
+            tv_img_shape=tv_img_shape,
+            tv_img_shm_name=tv_img_shm.name,
+            server_address=args.img_host,
+            port=args.img_port,
+        )
+        image_receive_thread = threading.Thread(target=img_client.receive_process, daemon=True)
+        image_receive_thread.start()
+        logger_mp.info(f"Image client connecting to {args.img_host}:{args.img_port} ...")
 
         # -- Robot -----------------------------------------------------------
         robot_interface = setup_robot_interface(args)
@@ -135,19 +152,29 @@ def main():
         arm_ik = robot_interface["arm_ik"]
         ee_shared_mem = robot_interface["ee_shared_mem"]
 
-        # -- Restore last episode arm position --------------------------------
-        if os.path.exists(_SAVED_Q_PATH):
-            saved_q = np.load(_SAVED_Q_PATH)
-            current_q = arm_ctrl.get_current_dual_arm_q()
-            logger_mp.info(f"Restoring arm to last episode position: {np.round(saved_q, 3)}")
-            steps = 200
-            for i in range(1, steps + 1):
-                interp_q = current_q + (saved_q - current_q) * (i / steps)
-                arm_ctrl.ctrl_dual_arm(interp_q, np.zeros(len(interp_q)))
-                time.sleep(0.01)
-            logger_mp.info("Arm restore complete.")
-        else:
-            logger_mp.info("No saved arm position found — starting from current pose.")
+        # Default home pose from training data (episode_0117)
+        _HOME_Q = np.array([
+            # left arm (7 DOF)
+            -0.37462687492370605,  0.05855492502450943,  0.18985410034656525,
+             0.6078758835792542,   0.09407617151737213, -0.9563771486282349,
+             0.09735984355211258,
+            # right arm (7 DOF)
+             0.1778099536895752,   0.09205083549022675, -1.2643357515335083,
+             1.3972288370132446,   1.1787084341049194,  -0.08017446845769882,
+            -0.09014534205198288,
+        ])
+
+        # -- Move to home or last episode position ----------------------------
+        target_q = np.load(_SAVED_Q_PATH) if os.path.exists(_SAVED_Q_PATH) else _HOME_Q
+        label = "last episode" if os.path.exists(_SAVED_Q_PATH) else "home"
+        current_q = arm_ctrl.get_current_dual_arm_q()
+        logger_mp.info(f"Moving arm to {label} position: {np.round(target_q, 3)}")
+        steps = 200
+        for i in range(1, steps + 1):
+            interp_q = current_q + (target_q - current_q) * (i / steps)
+            arm_ctrl.ctrl_dual_arm(interp_q, np.zeros(len(interp_q)))
+            time.sleep(0.01)
+        logger_mp.info("Arm ready.")
 
         # -- User confirm ----------------------------------------------------
         user_input = input("Enter 's' to start evaluation: ").strip().lower()
@@ -159,21 +186,18 @@ def main():
             f"Starting OpenVLA eval at {args.frequency} Hz | task: '{args.task}'"
         )
 
+        # Wait briefly for first frame to arrive
+        time.sleep(1.0)
         # Save the first frame for debugging (verify camera view matches training)
-        _debug_img = tv_img_array.copy()
-        if is_binocular:
-            _debug_img = _debug_img[:, : tv_img_shape[1] // 2]
-        cv2.imwrite("/tmp/eval_openvla_frame0.jpg", _debug_img)
+        cv2.imwrite("/tmp/eval_openvla_frame0.jpg", tv_img_array.copy())
         logger_mp.info("Saved first frame to /tmp/eval_openvla_frame0.jpg")
 
         step = 0
         while True:
             t0 = time.perf_counter()
 
-            # 1. Capture camera (single / left camera for binocular)
+            # 1. Capture head camera frame
             img = tv_img_array.copy()
-            if is_binocular:
-                img = img[:, : tv_img_shape[1] // 2]
             img_b64 = encode_image_jpeg(img)
 
             # 2. Forward kinematics — get current EE poses
@@ -237,8 +261,12 @@ def main():
             logger_mp.info(f"Saved arm position to {_SAVED_Q_PATH}")
         except Exception:
             pass
-        if image_info:
-            cleanup_resources(image_info)
+        if tv_img_shm is not None:
+            try:
+                tv_img_shm.close()
+                tv_img_shm.unlink()
+            except Exception:
+                pass
         logger_mp.info("End of eval.")
 
 
