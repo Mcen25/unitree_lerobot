@@ -51,14 +51,19 @@ def parse_args():
     p = argparse.ArgumentParser(description="OpenVLA inference server")
     p.add_argument(
         "--checkpoint",
-        default="/home/unitree/AlphaZ_WS/Checkpoints/OpenVLA/"
-                "openvla-7b+pick_n_place_orange_bottle+b4+lr-0.0005+lora-r8+dropout-0.0--image_aug",
-        help="Path to fine-tuned OpenVLA checkpoint directory (contains lora_adapter/ and dataset_statistics.json)",
+        default=None,
+        help="Path to fine-tuned OpenVLA checkpoint directory (contains lora_adapter/ and dataset_statistics.json). "
+             "Omit to run the base model without a LoRA adapter.",
     )
     p.add_argument(
         "--base-model",
         default="openvla/openvla-7b",
         help="Base model: HuggingFace ID or local snapshot path",
+    )
+    p.add_argument(
+        "--unnorm-key",
+        default="bridge_orig",
+        help="Action unnormalization key to use when running without a checkpoint (default: bridge_orig)",
     )
     p.add_argument("--port", type=int, default=5555, help="ZMQ REP port")
     p.add_argument(
@@ -74,10 +79,9 @@ def parse_args():
 # Model loading
 # ---------------------------------------------------------------------------
 
-def load_model_and_processor(checkpoint_path: str, base_model: str, dtype_str: str):
+def load_model_and_processor(checkpoint_path: str | None, base_model: str, dtype_str: str):
     import torch
     from transformers import AutoModelForVision2Seq, AutoProcessor
-    from peft import PeftModel
 
     dtype_map = {
         "float16": torch.float16,
@@ -89,8 +93,9 @@ def load_model_and_processor(checkpoint_path: str, base_model: str, dtype_str: s
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[server] Device: {device}")
 
-    print(f"[server] Loading processor from {checkpoint_path} ...")
-    processor = AutoProcessor.from_pretrained(checkpoint_path, trust_remote_code=True)
+    processor_src = checkpoint_path if checkpoint_path else base_model
+    print(f"[server] Loading processor from {processor_src} ...")
+    processor = AutoProcessor.from_pretrained(processor_src, trust_remote_code=True)
 
     print(f"[server] Loading base model from '{base_model}' ...")
     model = AutoModelForVision2Seq.from_pretrained(
@@ -102,22 +107,26 @@ def load_model_and_processor(checkpoint_path: str, base_model: str, dtype_str: s
         attn_implementation="eager",
     )
 
-    lora_path = os.path.join(checkpoint_path, "lora_adapter")
-    print(f"[server] Merging LoRA adapter from {lora_path} ...")
-    model = PeftModel.from_pretrained(model, lora_path)
-    model = model.merge_and_unload()
+    if checkpoint_path:
+        from peft import PeftModel
+        lora_path = os.path.join(checkpoint_path, "lora_adapter")
+        print(f"[server] Merging LoRA adapter from {lora_path} ...")
+        model = PeftModel.from_pretrained(model, lora_path)
+        model = model.merge_and_unload()
+
+        # Inject fine-tuned dataset normalization stats into the model.
+        # The base model only contains its original training dataset stats;
+        # the fine-tuned key (e.g. "pick_n_place_orange_bottle") must be added explicitly.
+        stats_path = os.path.join(checkpoint_path, "dataset_statistics.json")
+        with open(stats_path) as f:
+            custom_stats = json.load(f)
+        model.norm_stats.update(custom_stats)
+        print(f"[server] Injected norm_stats keys: {list(custom_stats.keys())}")
+    else:
+        print("[server] No checkpoint provided — running base model without LoRA adapter.")
 
     model = model.to(device)
     model.eval()
-
-    # Inject fine-tuned dataset normalization stats into the model.
-    # The base model only contains its original training dataset stats;
-    # the fine-tuned key (e.g. "pick_n_place_orange_bottle") must be added explicitly.
-    stats_path = os.path.join(checkpoint_path, "dataset_statistics.json")
-    with open(stats_path) as f:
-        custom_stats = json.load(f)
-    model.norm_stats.update(custom_stats)
-    print(f"[server] Injected norm_stats keys: {list(custom_stats.keys())}")
 
     print(f"[server] Model ready — {sum(p.numel() for p in model.parameters()) / 1e9:.1f}B params, dtype={dtype}")
     return model, processor, device
@@ -195,11 +204,14 @@ def main():
         args.checkpoint, args.base_model, args.dtype
     )
 
-    # Determine unnorm_key from dataset_statistics.json
-    stats_path = os.path.join(args.checkpoint, "dataset_statistics.json")
-    with open(stats_path) as f:
-        dataset_stats = json.load(f)
-    unnorm_key = list(dataset_stats.keys())[0]
+    # Determine unnorm_key: from checkpoint stats if available, else from --unnorm-key arg
+    if args.checkpoint:
+        stats_path = os.path.join(args.checkpoint, "dataset_statistics.json")
+        with open(stats_path) as f:
+            dataset_stats = json.load(f)
+        unnorm_key = list(dataset_stats.keys())[0]
+    else:
+        unnorm_key = args.unnorm_key
     print(f"[server] unnorm_key = '{unnorm_key}'")
 
     # ZMQ REP socket
