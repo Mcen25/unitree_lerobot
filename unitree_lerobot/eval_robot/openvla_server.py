@@ -157,8 +157,12 @@ def run_inference(
         for k, v in inputs.items()
     }
 
+    # Drop attention_mask: the vision encoder expands sequence length beyond the
+    # text-only mask size, causing a causal mask mismatch during generation.
+    # With batch_size=1 and no padding, attention_mask is not needed.
+    inputs_for_pred = {k: v for k, v in inputs.items() if k != "attention_mask"}
     with torch.no_grad():
-        action = model.predict_action(**inputs, unnorm_key=unnorm_key, do_sample=False)
+        action = model.predict_action(**inputs_for_pred, unnorm_key=unnorm_key, do_sample=False)
 
     if hasattr(action, "cpu"):
         action = action.cpu().numpy()
