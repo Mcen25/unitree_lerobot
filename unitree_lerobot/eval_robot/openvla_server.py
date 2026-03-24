@@ -154,11 +154,10 @@ def run_inference(
     # processor returns dict with input_ids, attention_mask, pixel_values
     inputs = processor(prompt, image)
 
-    # Move to device — pixel_values must stay float32 for the vision encoder
+    # Cast all tensor inputs to model dtype (float16 on Jetson)
     inputs = {
-        k: v.to(device, dtype=torch.float32) if k == "pixel_values" else v.to(device)
+        k: v.to(device, dtype=model.dtype) if hasattr(v, "to") else v
         for k, v in inputs.items()
-        if hasattr(v, "to")
     }
 
     with torch.no_grad():
