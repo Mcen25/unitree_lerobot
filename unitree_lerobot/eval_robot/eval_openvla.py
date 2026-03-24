@@ -164,14 +164,12 @@ def main():
             -0.09014534205198288,
         ])
 
-        # -- Move to home or last episode position ----------------------------
-        target_q = np.load(_SAVED_Q_PATH) if os.path.exists(_SAVED_Q_PATH) else _HOME_Q
-        label = "last episode" if os.path.exists(_SAVED_Q_PATH) else "home"
+        # -- Move to home position --------------------------------------------
         current_q = arm_ctrl.get_current_dual_arm_q()
-        logger_mp.info(f"Moving arm to {label} position: {np.round(target_q, 3)}")
+        logger_mp.info(f"Moving arm to home position: {np.round(_HOME_Q, 3)}")
         steps = 200
         for i in range(1, steps + 1):
-            interp_q = current_q + (target_q - current_q) * (i / steps)
+            interp_q = current_q + (_HOME_Q - current_q) * (i / steps)
             arm_ctrl.ctrl_dual_arm(interp_q, np.zeros(len(interp_q)))
             time.sleep(0.01)
         logger_mp.info("Arm ready.")
@@ -198,6 +196,9 @@ def main():
 
             # 1. Capture head camera frame
             img = tv_img_array.copy()
+            if step % 10 == 0:
+                img_hash = int(np.sum(img.astype(np.int64)) % 100000)
+                logger_mp.info(f"[step {step}] img_hash={img_hash} (changes → camera updating)")
             img_b64 = encode_image_jpeg(img)
 
             # 2. Forward kinematics — get current EE poses
@@ -254,13 +255,6 @@ def main():
     except Exception:
         traceback.print_exc()
     finally:
-        # Save final arm position so next run can restore it
-        try:
-            final_q = arm_ctrl.get_current_dual_arm_q()
-            np.save(_SAVED_Q_PATH, final_q)
-            logger_mp.info(f"Saved arm position to {_SAVED_Q_PATH}")
-        except Exception:
-            pass
         if tv_img_shm is not None:
             try:
                 tv_img_shm.close()
