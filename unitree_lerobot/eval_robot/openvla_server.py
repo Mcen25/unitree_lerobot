@@ -114,6 +114,16 @@ def load_model_and_processor(checkpoint_path: str, base_model: str, dtype_str: s
 
     model = model.to(device)
     model.eval()
+
+    # Inject fine-tuned dataset normalization stats into the model.
+    # The base model only contains its original training dataset stats;
+    # the fine-tuned key (e.g. "pick_n_place_orange_bottle") must be added explicitly.
+    stats_path = os.path.join(checkpoint_path, "dataset_statistics.json")
+    with open(stats_path) as f:
+        custom_stats = json.load(f)
+    model.norm_stats.update(custom_stats)
+    print(f"[server] Injected norm_stats keys: {list(custom_stats.keys())}")
+
     print(f"[server] Model ready — {sum(p.numel() for p in model.parameters()) / 1e9:.1f}B params, dtype={dtype}")
     return model, processor, device
 
@@ -166,16 +176,16 @@ def run_inference(
 def main():
     args = parse_args()
 
+    model, processor, device = load_model_and_processor(
+        args.checkpoint, args.base_model, args.dtype
+    )
+
     # Determine unnorm_key from dataset_statistics.json
     stats_path = os.path.join(args.checkpoint, "dataset_statistics.json")
     with open(stats_path) as f:
         dataset_stats = json.load(f)
     unnorm_key = list(dataset_stats.keys())[0]
     print(f"[server] unnorm_key = '{unnorm_key}'")
-
-    model, processor, device = load_model_and_processor(
-        args.checkpoint, args.base_model, args.dtype
-    )
 
     # ZMQ REP socket
     ctx = zmq.Context()

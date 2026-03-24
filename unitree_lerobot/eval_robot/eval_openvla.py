@@ -42,12 +42,19 @@ from unitree_lerobot.eval_robot.utils.utils import cleanup_resources
 # Geometry helpers
 # ---------------------------------------------------------------------------
 
-def get_current_ee_poses(ik_solver, arm_q: np.ndarray):
-    """Forward kinematics: returns (L_ee_4x4, R_ee_4x4) from current joint angles."""
-    pin.forwardKinematics(ik_solver.reduced_robot.model, ik_solver.reduced_robot.data, arm_q)
-    pin.updateFramePlacements(ik_solver.reduced_robot.model, ik_solver.reduced_robot.data)
-    L = ik_solver.reduced_robot.data.oMf[ik_solver.L_hand_id].homogeneous.copy()
-    R = ik_solver.reduced_robot.data.oMf[ik_solver.R_hand_id].homogeneous.copy()
+def get_current_ee_poses(ik_solver, arm_q: np.ndarray, _cache={}):
+    """Forward kinematics: returns (L_ee_4x4, R_ee_4x4) from current joint angles.
+
+    Creates a fresh pin.Data on first call (reduced_robot.data is stale because
+    L_ee / R_ee frames are added to the model after data was originally created).
+    """
+    if "data" not in _cache:
+        _cache["data"] = pin.Data(ik_solver.reduced_robot.model)
+    data = _cache["data"]
+    pin.forwardKinematics(ik_solver.reduced_robot.model, data, arm_q)
+    pin.updateFramePlacements(ik_solver.reduced_robot.model, data)
+    L = data.oMf[ik_solver.L_hand_id].homogeneous.copy()
+    R = data.oMf[ik_solver.R_hand_id].homogeneous.copy()
     return L, R
 
 
