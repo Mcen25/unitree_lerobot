@@ -161,7 +161,22 @@ def run_inference(
     # text-only mask size, causing a causal mask mismatch during generation.
     # With batch_size=1 and no padding, attention_mask is not needed.
     inputs_for_pred = {k: v for k, v in inputs.items() if k != "attention_mask"}
+
+    import numpy as _np
+    _pv = inputs_for_pred.get("pixel_values")
+    if _pv is not None:
+        _arr = _pv.float().cpu().numpy()
+        print(f"[dbg] pixel_values sum={_arr.sum():.1f} mean={_arr.mean():.4f} std={_arr.std():.4f}")
+
     with torch.no_grad():
+        # Get raw predicted token IDs to verify model is producing varied outputs
+        _raw = model.generate(
+            **inputs_for_pred,
+            max_new_tokens=7,
+            do_sample=False,
+        )
+        _new_tokens = _raw[0, -7:].tolist()
+        print(f"[dbg] raw token IDs: {_new_tokens}")
         action = model.predict_action(**inputs_for_pred, unnorm_key=unnorm_key, do_sample=False)
 
     if hasattr(action, "cpu"):
