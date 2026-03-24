@@ -467,6 +467,85 @@ LIFT_G1_DEX1_NOUSEWAIST_CONFIG = RobotConfig(
     json_action_data_name=["left_arm.qpos", "right_arm.qpos", "torso.qvel", "left_ee.qpos", "right_ee.qpos"],
 )
 
+G1_INSPIRE_SINGLE_CAM_CONFIG = RobotConfig(
+    motors=[
+        "kLeftShoulderPitch",
+        "kLeftShoulderRoll",
+        "kLeftShoulderYaw",
+        "kLeftElbow",
+        "kLeftWristRoll",
+        "kLeftWristPitch",
+        "kLeftWristYaw",
+        "kRightShoulderPitch",
+        "kRightShoulderRoll",
+        "kRightShoulderYaw",
+        "kRightElbow",
+        "kRightWristRoll",
+        "kRightWristPitch",
+        "kRightWristYaw",
+        "kLeftHandPinky",
+        "kLeftHandRing",
+        "kLeftHandMiddle",
+        "kLeftHandIndex",
+        "kLeftHandThumbBend",
+        "kLeftHandThumbRotation",
+        "kRightHandPinky",
+        "kRightHandRing",
+        "kRightHandMiddle",
+        "kRightHandIndex",
+        "kRightHandThumbBend",
+        "kRightHandThumbRotation",
+    ],
+    cameras=["cam_high"],
+    camera_to_image_key={"color_0": "cam_high"},
+    json_state_data_name=["left_arm.qpos", "right_arm.qpos", "left_ee.qpos", "right_ee.qpos"],
+    json_action_data_name=["left_arm.qpos", "right_arm.qpos", "left_ee.qpos", "right_ee.qpos"],
+)
+
+
+G1_INSPIRE_LEFT_ARM_CONFIG = RobotConfig(
+    motors=[
+        "ee_x",
+        "ee_y",
+        "ee_z",
+        "ee_roll",
+        "ee_pitch",
+        "ee_yaw",
+        "ee_gripper",
+    ],
+    cameras=["cam_high"],
+    camera_to_image_key={"color_0": "cam_high"},
+    json_state_data_name=["left_ee_abs.qpos"],
+    json_action_data_name=["left_ee_delta.qpos"],
+)
+
+
+G1_INSPIRE_FTP_SINGLE_CAM_CONFIG = RobotConfig(
+    motors=[
+        "kLeftShoulderPitch",
+        "kLeftShoulderRoll",
+        "kLeftShoulderYaw",
+        "kLeftElbow",
+        "kLeftWristRoll",
+        "kLeftWristPitch",
+        "kLeftWristYaw",
+        "kRightShoulderPitch",
+        "kRightShoulderRoll",
+        "kRightShoulderYaw",
+        "kRightElbow",
+        "kRightWristRoll",
+        "kRightWristPitch",
+        "kRightWristYaw",
+        "kLeftGripper",
+        "kRightGripper",
+    ],
+    cameras=["cam_high"],
+    camera_to_image_key={"color_0": "cam_high"},
+    json_state_data_name=["left_arm.qpos", "right_arm.qpos", "left_ee.qpos", "right_ee.qpos"],
+    json_action_data_name=["left_arm.qpos", "right_arm.qpos", "left_ee.qpos", "right_ee.qpos"],
+)
+
+
 ROBOT_CONFIGS = {
     "Unitree_Z1_Single": Z1_SINGLE_CONFIG,
     "Unitree_Z1_Dual": Z1_CONFIG,
@@ -475,8 +554,11 @@ ROBOT_CONFIGS = {
     "Unitree_G1_Dex3": G1_DEX3_CONFIG,
     "Unitree_G1_Brainco": G1_BRAINCO_CONFIG,
     "Unitree_G1_Inspire": G1_INSPIRE_CONFIG,
+    "Unitree_G1_Inspire_SingleCam": G1_INSPIRE_SINGLE_CAM_CONFIG,
+    "Unitree_G1_Inspire_LeftArm": G1_INSPIRE_LEFT_ARM_CONFIG,
     "Unitree_G1_MoveibleLift_Dex1_UseWaist": MOVEIBLE_LIFT_G1_DEX1_USEWAIST_CONFIG,
     "Unitree_G1_MoveibleLift_Dex1_NoUseWaist": MOVEIBLE_LIFT_G1_DEX1_NOUSEWAIST_CONFIG,
     "Unitree_G1_Lift_Dex1_UseWaist": LIFT_G1_DEX1_USEWAIST_CONFIG,
     "Unitree_G1_Lift_Dex1_NoUseWaist": LIFT_G1_DEX1_NOUSEWAIST_CONFIG,
+    "Unitree_G1_Inspire_FTP_SingleCam": G1_INSPIRE_FTP_SINGLE_CAM_CONFIG,
 }

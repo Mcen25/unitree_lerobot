@@ -40,7 +40,7 @@ class Brainco_Controller:
         if self.simulation_mode:
             ChannelFactoryInitialize(1)
         else:
-            ChannelFactoryInitialize(0)
+            ChannelFactoryInitialize(0, "enP8p1s0")
 
         # initialize handcmd publisher and handstate subscriber
         self.LeftHandCmb_publisher = ChannelPublisher(kTopicbraincoLeftCommand, MotorCmds_)

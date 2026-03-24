@@ -15,8 +15,8 @@ from multiprocessing import Process, Value, Array
 
 import logging_mp
 
-logging_mp.basic_config(level=logging_mp.INFO)
-logger_mp = logging_mp.get_logger(__name__)
+logging_mp.basicConfig(level=logging_mp.INFO)
+logger_mp = logging_mp.getLogger(__name__)
 
 
 unitree_tip_indices = [4, 9, 14]  # [thumb, index, middle] in OpenXR
@@ -59,7 +59,7 @@ class Dex3_1_Controller:
         if self.simulation_mode:
             ChannelFactoryInitialize(1)
         else:
-            ChannelFactoryInitialize(0)
+            ChannelFactoryInitialize(0, "enP8p1s0")
 
         # initialize handcmd publisher and handstate subscriber
         self.LeftHandCmb_publisher = ChannelPublisher(kTopicDex3LeftCommand, HandCmd_)
@@ -277,7 +277,7 @@ class Dex1_1_Gripper_Controller:
         if self.simulation_mode:
             ChannelFactoryInitialize(1)
         else:
-            ChannelFactoryInitialize(0)
+            ChannelFactoryInitialize(0, "enP8p1s0")
 
         # initialize handcmd publisher and handstate subscriber
         self.LeftGripperCmb_publisher = ChannelPublisher(kTopicGripperLeftCommand, MotorCmds_)

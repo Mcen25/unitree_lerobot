@@ -17,7 +17,7 @@ from unitree_lerobot.eval_robot.robot_control.robot_hand_unitree import (
 
 from unitree_lerobot.eval_robot.utils.episode_writer import EpisodeWriter
 
-from unitree_lerobot.eval_robot.robot_control.robot_hand_inspire import Inspire_Controller
+from unitree_lerobot.eval_robot.robot_control.robot_hand_inspire import Inspire_Controller, Inspire_Controller_FTP
 from unitree_lerobot.eval_robot.robot_control.robot_hand_brainco import Brainco_Controller
 
 
@@ -57,6 +57,12 @@ EE_CONFIG: dict[str, dict[str, Any]] = {
         "shared_mem_type": "Array",
         "shared_mem_size": 6,
         # "out_len": 12,
+    },
+    "inspire_ftp": {
+        "controller": Inspire_Controller_FTP,
+        "dof": 1,
+        "shared_mem_type": "Value",
+        # 1 gripper value per hand (open/close), maps to all 6 FTP fingers
     },
     "brainco": {
         "controller": Brainco_Controller,

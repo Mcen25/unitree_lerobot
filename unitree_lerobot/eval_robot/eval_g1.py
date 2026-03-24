@@ -7,6 +7,7 @@ Refer to:   lerobot/lerobot/scripts/eval.py
 import time
 import torch
 import logging
+import traceback
 
 import numpy as np
 from pprint import pformat
@@ -160,6 +161,7 @@ def eval_policy(
                 # Maintain frequency
                 time.sleep(max(0, (1.0 / cfg.frequency) - (time.perf_counter() - loop_start_time)))
     except Exception as e:
+        traceback.print_exc()
         logger_mp.info(f"An error occurred: {e}")
     finally:
         if image_info:
