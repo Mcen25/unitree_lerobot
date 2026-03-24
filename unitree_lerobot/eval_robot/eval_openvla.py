@@ -21,6 +21,7 @@ Usage (robot Jetson NX):
 
 import argparse
 import base64
+import os
 import time
 import traceback
 
@@ -118,7 +119,9 @@ def main():
     socket.setsockopt(zmq.RCVTIMEO, 15000)  # 15 s timeout per inference call
     logger_mp.info(f"Connecting to OpenVLA server at {args.server_host}:{args.server_port}")
 
+    _SAVED_Q_PATH = "/tmp/eval_openvla_last_q.npy"
     image_info = None
+    arm_ctrl = None
     try:
         # -- Camera ----------------------------------------------------------
         image_info = setup_image_client(args)
@@ -132,6 +135,20 @@ def main():
         arm_ik = robot_interface["arm_ik"]
         ee_shared_mem = robot_interface["ee_shared_mem"]
 
+        # -- Restore last episode arm position --------------------------------
+        if os.path.exists(_SAVED_Q_PATH):
+            saved_q = np.load(_SAVED_Q_PATH)
+            current_q = arm_ctrl.get_current_dual_arm_q()
+            logger_mp.info(f"Restoring arm to last episode position: {np.round(saved_q, 3)}")
+            steps = 200
+            for i in range(1, steps + 1):
+                interp_q = current_q + (saved_q - current_q) * (i / steps)
+                arm_ctrl.ctrl_dual_arm(interp_q, np.zeros(len(interp_q)))
+                time.sleep(0.01)
+            logger_mp.info("Arm restore complete.")
+        else:
+            logger_mp.info("No saved arm position found — starting from current pose.")
+
         # -- User confirm ----------------------------------------------------
         user_input = input("Enter 's' to start evaluation: ").strip().lower()
         if user_input != "s":
@@ -141,6 +158,13 @@ def main():
         logger_mp.info(
             f"Starting OpenVLA eval at {args.frequency} Hz | task: '{args.task}'"
         )
+
+        # Save the first frame for debugging (verify camera view matches training)
+        _debug_img = tv_img_array.copy()
+        if is_binocular:
+            _debug_img = _debug_img[:, : tv_img_shape[1] // 2]
+        cv2.imwrite("/tmp/eval_openvla_frame0.jpg", _debug_img)
+        logger_mp.info("Saved first frame to /tmp/eval_openvla_frame0.jpg")
 
         step = 0
         while True:
@@ -175,19 +199,19 @@ def main():
             target_L = apply_delta_ee(L_ee, action[:3], action[3:6])
             target_R = R_ee
 
-            # 5. IK → joint positions + torques
+            # 5. IK → joint positions + torques (left arm only)
             sol_q, sol_tau = arm_ik.solve_ik(target_L, target_R, current_arm_q)
+            # Lock right arm at current joint angles — only left arm should move
+            sol_q[7:] = current_arm_q[7:]
+            sol_tau[7:] = 0.0
             arm_ctrl.ctrl_dual_arm(sol_q, sol_tau)
 
-            # 6. Gripper (single open/close value per hand)
+            # 6. Left gripper only — right gripper stays fixed
             gripper_val = float(np.clip(action[6], 0.0, 1.0))
             if ee_shared_mem:
                 left_mem = ee_shared_mem.get("left")
-                right_mem = ee_shared_mem.get("right")
                 if left_mem is not None and hasattr(left_mem, "value"):
                     left_mem.value = gripper_val
-                if right_mem is not None and hasattr(right_mem, "value"):
-                    right_mem.value = gripper_val
 
             if step % 10 == 0:
                 logger_mp.info(
@@ -206,6 +230,13 @@ def main():
     except Exception:
         traceback.print_exc()
     finally:
+        # Save final arm position so next run can restore it
+        try:
+            final_q = arm_ctrl.get_current_dual_arm_q()
+            np.save(_SAVED_Q_PATH, final_q)
+            logger_mp.info(f"Saved arm position to {_SAVED_Q_PATH}")
+        except Exception:
+            pass
         if image_info:
             cleanup_resources(image_info)
         logger_mp.info("End of eval.")

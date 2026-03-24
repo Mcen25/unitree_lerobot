@@ -143,22 +143,26 @@ class Inspire_Controller_FTP:
         left_gripper_value / right_gripper_value: multiprocessing.Value('d')
             Policy outputs a single [0,1] gripper value per hand.
             0 = fully closed, 1 = fully open.
-            All 6 FTP finger joints receive the same scaled command.
+            Interpolates between calibrated open/closed poses per joint.
         dual_hand_state_array: Array of size 2 — [left_gripper_state, right_gripper_state]
         """
+        # Per-joint open/closed poses matching xr_teleoperate calibration
+        left_open_pose   = np.array([0.0, 0.0, 1.0, 1.0, 1.0, 0.0])
+        left_closed_pose = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        # Right hand stays at a fixed safe pose — not controlled by policy
+        right_fixed_pose = np.array([0.0, 0.0, 0.0, 0.0, 0.2, 0.0])
+
         self.running = True
-        left_val  = 1.0  # default open
-        right_val = 1.0
+        left_val = 1.0  # default open
 
         try:
             while self.running:
                 start_time = time.time()
 
-                # Read policy action (single gripper value per hand)
+                # Read policy action (single gripper value for left hand only)
                 with left_gripper_value.get_lock():
                     left_val = float(left_gripper_value.value)
-                with right_gripper_value.get_lock():
-                    right_val = float(right_gripper_value.value)
+                left_val = float(np.clip(left_val, 0.0, 1.0))
 
                 # State: mean of 6 finger positions → single [0,1] value per hand
                 with left_hand_state_array.get_lock():
@@ -169,13 +173,12 @@ class Inspire_Controller_FTP:
                 if dual_hand_data_lock is not None:
                     with dual_hand_data_lock:
                         dual_hand_state_array[:] = [left_state, right_state]
-                        dual_hand_action_array[:] = [left_val, right_val]
+                        dual_hand_action_array[:] = [left_val, left_val]
 
-                # Apply single gripper value to all 6 fingers
-                scaled = int(np.clip(left_val * 1000, 0, 1000))
-                scaled_left = [scaled] * FTP_Num_Motors
-                scaled = int(np.clip(right_val * 1000, 0, 1000))
-                scaled_right = [scaled] * FTP_Num_Motors
+                # Interpolate left hand between closed (0) and open (1) poses
+                left_q = left_closed_pose + left_val * (left_open_pose - left_closed_pose)
+                scaled_left  = [int(np.clip(v * 1000, 0, 1000)) for v in left_q]
+                scaled_right = [int(np.clip(v * 1000, 0, 1000)) for v in right_fixed_pose]
                 self._send_hand_command(scaled_left, scaled_right)
 
                 time.sleep(max(0, (1 / self.fps) - (time.time() - start_time)))
