@@ -1,25 +1,24 @@
 """
-OpenVLA inference server — run this on the Jetson Thor (or any CUDA machine).
+OpenVLA-OFT inference server — run this on the Jetson Thor (or any CUDA machine).
 
-Loads openvla-7b + LoRA fine-tune adapter, listens for image+task requests
-over ZMQ, and returns 7-DOF delta EE actions to the robot.
+Loads openvla-7b + OFT fine-tune (L1RegressionActionHead), listens for image+task
+requests over ZMQ, and returns 7-DOF delta EE actions to the robot client.
+
+The checkpoint directory must contain:
+  - model-*.safetensors          merged (base + LoRA) model weights
+  - action_head--*_checkpoint.pt L1RegressionActionHead weights
+  - dataset_statistics.json      action normalization statistics
+  - modeling_prismatic.py        OFT-extended model code (auto-synced from training)
 
 Usage (Jetson Thor):
-    conda activate <env_with_transformers_peft>
+    conda activate <env>
     python openvla_server.py \\
-        --checkpoint /path/to/Checkpoints/OpenVLA/openvla-7b+pick_n_place_orange_bottle+... \\
-        --port 5555
-
-    # If base model is already cached locally, pass the snapshot path:
-    python openvla_server.py \\
-        --checkpoint /path/to/checkpoint \\
-        --base-model /home/user/.cache/huggingface/hub/models--openvla--openvla-7b/snapshots/<hash> \\
+        --checkpoint /path/to/openvla-7b+orange_in_black_box_4+... \\
         --port 5555
 
 Notes for Jetson Thor (aarch64):
-  - flash_attention_2 is NOT used (not available on aarch64) — uses eager attention
-  - pixel_values are cast to float32 (required by OpenVLA vision encoder)
-  - model weights loaded in float16 by default (stable on all Jetson variants)
+  - flash_attention_2 is NOT used — eager attention is used instead
+  - float16 weights are recommended (stable on all Jetson variants)
   - 64 GB unified memory is sufficient for openvla-7b in float16 (~14 GB)
 """
 
@@ -27,12 +26,89 @@ import argparse
 import base64
 import json
 import os
+import sys
 import traceback
 from io import BytesIO
 
 import numpy as np
 import zmq
 from PIL import Image
+
+
+# ---------------------------------------------------------------------------
+# Minimal prismatic stubs
+#
+# The checkpoint's modeling_prismatic.py imports from prismatic.training.train_utils
+# and prismatic.vla.constants.  The full openvla-oft prismatic package pulls in
+# torch.distributed.fsdp which is broken on this PyTorch build.  We inject
+# lightweight stubs into sys.modules before HuggingFace's trust_remote_code
+# mechanism runs check_imports(), so it never touches the real package.
+# ---------------------------------------------------------------------------
+
+def _inject_prismatic_stubs(num_actions_chunk: int = 8) -> None:
+    """Populate sys.modules with the minimal prismatic shims that modeling_prismatic.py needs."""
+    import types
+    from enum import Enum
+
+    # Skip if real package is already loaded and working.
+    if "prismatic" in sys.modules and not getattr(sys.modules["prismatic"], "_is_stub", False):
+        return
+
+    # --- prismatic.vla.constants ---
+    class NormalizationType(str, Enum):
+        NORMAL = "normal"
+        BOUNDS = "bounds"
+        BOUNDS_Q99 = "bounds_q99"
+
+    constants_mod = types.ModuleType("prismatic.vla.constants")
+    constants_mod.ACTION_DIM = 7
+    constants_mod.ACTION_TOKEN_BEGIN_IDX = 31743
+    constants_mod.IGNORE_INDEX = -100
+    constants_mod.STOP_INDEX = 2
+    constants_mod.NUM_ACTIONS_CHUNK = num_actions_chunk
+    constants_mod.NormalizationType = NormalizationType
+    constants_mod.ACTION_PROPRIO_NORMALIZATION_TYPE = NormalizationType.BOUNDS_Q99
+
+    # --- prismatic.training.train_utils ---
+    # These two functions are the only things modeling_prismatic.py uses from the package.
+    def get_current_action_mask(token_ids):
+        import torch
+        newline_positions = token_ids != -100           # IGNORE_INDEX
+        cumsum = torch.cumsum(newline_positions, dim=1)
+        mask = (1 <= cumsum) & (cumsum <= 7)            # ACTION_DIM
+        return (token_ids > 31743) * mask               # ACTION_TOKEN_BEGIN_IDX
+
+    def get_next_actions_mask(token_ids):
+        import torch
+        newline_positions = token_ids != -100
+        cumsum = torch.cumsum(newline_positions, dim=1)
+        mask = cumsum > 7
+        return (token_ids > 31743) * mask
+
+    train_utils_mod = types.ModuleType("prismatic.training.train_utils")
+    train_utils_mod.get_current_action_mask = get_current_action_mask
+    train_utils_mod.get_next_actions_mask = get_next_actions_mask
+
+    # Build the package hierarchy so attribute access works too.
+    prismatic_mod  = types.ModuleType("prismatic");  prismatic_mod._is_stub = True
+    vla_mod        = types.ModuleType("prismatic.vla")
+    training_mod   = types.ModuleType("prismatic.training")
+    models_mod     = types.ModuleType("prismatic.models")
+
+    prismatic_mod.vla      = vla_mod
+    prismatic_mod.training = training_mod
+    prismatic_mod.models   = models_mod
+    vla_mod.constants      = constants_mod
+    training_mod.train_utils = train_utils_mod
+
+    sys.modules.update({
+        "prismatic":                       prismatic_mod,
+        "prismatic.vla":                   vla_mod,
+        "prismatic.vla.constants":         constants_mod,
+        "prismatic.training":              training_mod,
+        "prismatic.training.train_utils":  train_utils_mod,
+        "prismatic.models":                models_mod,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -48,30 +124,53 @@ def make_prompt(task: str) -> str:
 # ---------------------------------------------------------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser(description="OpenVLA inference server")
+    p = argparse.ArgumentParser(description="OpenVLA-OFT inference server")
     p.add_argument(
         "--checkpoint",
         default=None,
-        help="Path to fine-tuned OpenVLA checkpoint directory (contains lora_adapter/ and dataset_statistics.json). "
-             "Omit to run the base model without a LoRA adapter.",
+        help="Path to the OFT checkpoint directory (contains merged safetensors, "
+             "action_head--*_checkpoint.pt, dataset_statistics.json). "
+             "Omit to run the base model without an action head.",
     )
     p.add_argument(
         "--base-model",
         default="openvla/openvla-7b",
-        help="Base model: HuggingFace ID or local snapshot path",
-    )
-    p.add_argument(
-        "--unnorm-key",
-        default="bridge_orig",
-        help="Action unnormalization key to use when running without a checkpoint (default: bridge_orig)",
+        help="Base model: HuggingFace ID or local snapshot path. "
+             "Only used when the checkpoint has no merged model weights.",
     )
     p.add_argument("--port", type=int, default=5555, help="ZMQ REP port")
     p.add_argument(
         "--dtype",
         default="float16",
         choices=["float16", "bfloat16", "float32"],
-        help="Model weight dtype. float16 is recommended for Jetson aarch64.",
+        help="Model weight dtype (float16 recommended for Jetson aarch64).",
     )
+    p.add_argument(
+        "--num-actions-chunk",
+        type=int,
+        default=8,
+        help="Action chunk size used during fine-tuning (default: 8, matching the "
+             "LIBERO/default constant used by openvla-oft when no platform keyword "
+             "appears in the training command).",
+    )
+    p.add_argument(
+        "--open-loop-steps",
+        type=int,
+        default=1,
+        help="Steps to execute open-loop from each predicted chunk before re-running "
+             "inference. 1 = closed-loop (infer every step, recommended). "
+             "Set equal to --num-actions-chunk for fully open-loop execution.",
+    )
+    p.add_argument(
+        "--unnorm-key",
+        default="bridge_orig",
+        help="Action unnormalization key when running without a checkpoint.",
+    )
+    # Legacy LoRA-merge options (ignored when checkpoint has merged weights)
+    p.add_argument("--merged-cache", default=None,
+                   help="[Legacy] Directory to cache a LoRA-merged model.")
+    p.add_argument("--clear-cache", action="store_true",
+                   help="[Legacy] Delete merged model cache and re-merge.")
     return p.parse_args()
 
 
@@ -79,57 +178,195 @@ def parse_args():
 # Model loading
 # ---------------------------------------------------------------------------
 
-def load_model_and_processor(checkpoint_path: str | None, base_model: str, dtype_str: str):
+def _has_merged_weights(checkpoint_path: str | None) -> bool:
+    if not checkpoint_path:
+        return False
+    return (
+        os.path.isfile(os.path.join(checkpoint_path, "model.safetensors.index.json"))
+        or os.path.isfile(os.path.join(checkpoint_path, "model.safetensors"))
+    )
+
+
+def load_model_and_processor(
+    checkpoint_path: str | None,
+    base_model: str,
+    dtype_str: str,
+    num_actions_chunk: int = 8,
+    merged_cache: str | None = None,
+    clear_cache: bool = False,
+):
     import torch
     from transformers import AutoModelForVision2Seq, AutoProcessor
 
-    dtype_map = {
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-        "float32": torch.float32,
-    }
+    dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
     dtype = dtype_map[dtype_str]
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[server] Device: {device}")
 
-    processor_src = checkpoint_path if checkpoint_path else base_model
-    print(f"[server] Loading processor from {processor_src} ...")
-    processor = AutoProcessor.from_pretrained(processor_src, trust_remote_code=True)
+    # ------------------------------------------------------------------
+    # OFT path: checkpoint already contains merged model weights.
+    # Inject prismatic stubs BEFORE from_pretrained so HuggingFace's
+    # check_imports() resolves prismatic.* without loading the full package.
+    # ------------------------------------------------------------------
+    if _has_merged_weights(checkpoint_path):
+        _inject_prismatic_stubs(num_actions_chunk)
 
-    print(f"[server] Loading base model from '{base_model}' ...")
-    model = AutoModelForVision2Seq.from_pretrained(
-        base_model,
-        torch_dtype=dtype,
-        low_cpu_mem_usage=True,
-        trust_remote_code=True,
-        # flash_attention_2 is NOT available on aarch64 — use eager
-        attn_implementation="eager",
-    )
+        print(f"[server] Loading processor from {checkpoint_path} ...")
+        processor = AutoProcessor.from_pretrained(checkpoint_path, trust_remote_code=True)
 
-    if checkpoint_path:
-        from peft import PeftModel
-        lora_path = os.path.join(checkpoint_path, "lora_adapter")
-        print(f"[server] Merging LoRA adapter from {lora_path} ...")
-        model = PeftModel.from_pretrained(model, lora_path)
-        model = model.merge_and_unload()
+        print(f"[server] Loading merged OFT model from {checkpoint_path} ...")
+        model = AutoModelForVision2Seq.from_pretrained(
+            checkpoint_path,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+            attn_implementation="eager",
+        )
 
-        # Inject fine-tuned dataset normalization stats into the model.
-        # The base model only contains its original training dataset stats;
-        # the fine-tuned key (e.g. "pick_n_place_orange_bottle") must be added explicitly.
         stats_path = os.path.join(checkpoint_path, "dataset_statistics.json")
         with open(stats_path) as f:
             custom_stats = json.load(f)
         model.norm_stats.update(custom_stats)
         print(f"[server] Injected norm_stats keys: {list(custom_stats.keys())}")
+
+    # ------------------------------------------------------------------
+    # Legacy path: no merged weights → load base model and merge LoRA.
+    # ------------------------------------------------------------------
     else:
-        print("[server] No checkpoint provided — running base model without LoRA adapter.")
+        processor_src = checkpoint_path if checkpoint_path else base_model
+        print(f"[server] Loading processor from {processor_src} ...")
+        processor = AutoProcessor.from_pretrained(processor_src, trust_remote_code=True)
+
+        print(f"[server] Loading base model from '{base_model}' ...")
+        model = AutoModelForVision2Seq.from_pretrained(
+            base_model,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+            attn_implementation="eager",
+        )
+
+        if checkpoint_path:
+            import shutil
+
+            stats_path = os.path.join(checkpoint_path, "dataset_statistics.json")
+            with open(stats_path) as f:
+                custom_stats = json.load(f)
+
+            if clear_cache and merged_cache and os.path.isdir(merged_cache):
+                print(f"[server] --clear-cache: removing {merged_cache} ...")
+                shutil.rmtree(merged_cache)
+
+            if merged_cache and os.path.isdir(merged_cache):
+                print(f"[server] Loading merged model from cache: {merged_cache} ...")
+                model = AutoModelForVision2Seq.from_pretrained(
+                    merged_cache, torch_dtype=dtype, low_cpu_mem_usage=True,
+                    trust_remote_code=True, attn_implementation="eager",
+                )
+            else:
+                from peft import PeftModel
+                lora_path = os.path.join(checkpoint_path, "lora_adapter")
+                print(f"[server] Merging LoRA adapter from {lora_path} ...")
+                model = PeftModel.from_pretrained(model, lora_path)
+                model = model.merge_and_unload()
+                if merged_cache:
+                    print(f"[server] Saving merged model to cache: {merged_cache} ...")
+                    model.save_pretrained(merged_cache)
+                    processor.save_pretrained(merged_cache)
+
+            model.norm_stats.update(custom_stats)
+            print(f"[server] Injected norm_stats keys: {list(custom_stats.keys())}")
+        else:
+            print("[server] No checkpoint — running base model without LoRA.")
 
     model = model.to(device)
     model.eval()
-
-    print(f"[server] Model ready — {sum(p.numel() for p in model.parameters()) / 1e9:.1f}B params, dtype={dtype}")
+    n_params = sum(p.numel() for p in model.parameters()) / 1e9
+    print(f"[server] Model ready — {n_params:.1f}B params, dtype={dtype}")
     return model, processor, device
+
+
+# ---------------------------------------------------------------------------
+# Action head
+# ---------------------------------------------------------------------------
+
+def load_action_head(checkpoint_path: str, device: str, dtype_str: str):
+    """Load L1RegressionActionHead from action_head--*_checkpoint.pt."""
+    import glob
+    import torch
+    import torch.nn as nn
+
+    pattern = os.path.join(checkpoint_path, "action_head--*_checkpoint.pt")
+    matches = glob.glob(pattern)
+    if not matches:
+        print("[server] No action head checkpoint found — using token-based prediction.")
+        return None
+
+    action_head_path = matches[0]
+    print(f"[server] Loading action head from {action_head_path} ...")
+
+    # Self-contained implementation matching openvla-oft exactly.
+    class _MLPResNetBlock(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.ffn = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, dim), nn.ReLU())
+
+        def forward(self, x):
+            return x + self.ffn(x)
+
+    class _MLPResNet(nn.Module):
+        def __init__(self, num_blocks, input_dim, hidden_dim, output_dim):
+            super().__init__()
+            self.layer_norm1 = nn.LayerNorm(input_dim)
+            self.fc1 = nn.Linear(input_dim, hidden_dim)
+            self.relu = nn.ReLU()
+            self.mlp_resnet_blocks = nn.ModuleList(
+                [_MLPResNetBlock(hidden_dim) for _ in range(num_blocks)]
+            )
+            self.layer_norm2 = nn.LayerNorm(hidden_dim)
+            self.fc2 = nn.Linear(hidden_dim, output_dim)
+
+        def forward(self, x):
+            x = self.layer_norm1(x)
+            x = self.fc1(x)
+            x = self.relu(x)
+            for block in self.mlp_resnet_blocks:
+                x = block(x)
+            x = self.layer_norm2(x)
+            return self.fc2(x)
+
+    class _L1RegressionActionHead(nn.Module):
+        _ACTION_DIM = 7
+        _LLM_DIM    = 4096
+
+        def __init__(self):
+            super().__init__()
+            self.model = _MLPResNet(
+                num_blocks=2,
+                input_dim=self._LLM_DIM * self._ACTION_DIM,  # 28672
+                hidden_dim=self._LLM_DIM,
+                output_dim=self._ACTION_DIM,
+            )
+
+        def predict_action(self, actions_hidden_states):
+            # actions_hidden_states: (B, num_chunks * ACTION_DIM, LLM_DIM)
+            B, n_tokens, llm_dim = actions_hidden_states.shape
+            num_chunks = n_tokens // self._ACTION_DIM
+            # Reshape so each chunk has ACTION_DIM consecutive hidden states concatenated
+            rearranged = actions_hidden_states.reshape(B, num_chunks, self._ACTION_DIM * llm_dim)
+            return self.model(rearranged)  # (B, num_chunks, ACTION_DIM)
+
+    action_head = _L1RegressionActionHead()
+
+    # Load weights, stripping DDP "module." prefix if present.
+    dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
+    raw_sd = torch.load(action_head_path, map_location="cpu", weights_only=True)
+    clean_sd = {(k[7:] if k.startswith("module.") else k): v for k, v in raw_sd.items()}
+    action_head.load_state_dict(clean_sd)
+    action_head = action_head.to(device=device, dtype=dtype_map[dtype_str])
+    action_head.eval()
+    print("[server] Action head ready.")
+    return action_head
 
 
 # ---------------------------------------------------------------------------
@@ -139,58 +376,71 @@ def load_model_and_processor(checkpoint_path: str | None, base_model: str, dtype
 def run_inference(
     model,
     processor,
+    action_head,
     image: Image.Image,
     task: str,
     unnorm_key: str,
     device: str,
-) -> list:
+) -> list[list[float]]:
     """
-    One forward pass of OpenVLA.
-    Returns unnormalized 7-DOF action: [dx, dy, dz, d_roll, d_pitch, d_yaw, gripper]
+    Run one forward pass and return the predicted action chunk.
 
-    Important: pixel_values MUST be float32 for OpenVLA's vision encoder,
-    regardless of the model's weight dtype.
+    OFT path (action_head provided):
+        Calls the OFT predict_action() which appends NUM_ACTIONS_CHUNK*7 placeholder
+        tokens, zeros their embeddings, does a single non-autoregressive forward pass,
+        extracts hidden states at the action positions, and passes them through the MLP
+        action head. Returns a list of num_actions_chunk 7-element action arrays.
+
+    Legacy path (no action_head):
+        Autoregressively generates 7 action tokens and decodes them via vocabulary
+        unnormalization. Returns a list containing one 7-element action array.
     """
     import torch
 
     prompt = make_prompt(task)
-
-    # processor returns dict with input_ids, attention_mask, pixel_values
     inputs = processor(prompt, image)
-
-    # Float tensors (pixel_values) → model dtype; integer tensors (input_ids) → device only
     inputs = {
-        k: v.to(device, dtype=model.dtype) if (hasattr(v, "to") and v.is_floating_point())
-        else v.to(device) if hasattr(v, "to")
-        else v
+        k: (
+            v.to(device, dtype=model.dtype) if (hasattr(v, "to") and v.is_floating_point())
+            else v.to(device) if hasattr(v, "to")
+            else v
+        )
         for k, v in inputs.items()
     }
 
-    # Drop attention_mask: the vision encoder expands sequence length beyond the
-    # text-only mask size, causing a causal mask mismatch during generation.
-    # With batch_size=1 and no padding, attention_mask is not needed.
-    inputs_for_pred = {k: v for k, v in inputs.items() if k != "attention_mask"}
-
-    import numpy as _np
-    _pv = inputs_for_pred.get("pixel_values")
-    if _pv is not None:
-        _arr = _pv.float().cpu().numpy()
-        print(f"[dbg] pixel_values sum={_arr.sum():.1f} mean={_arr.mean():.4f} std={_arr.std():.4f}")
-
     with torch.no_grad():
-        # Get raw predicted token IDs to verify model is producing varied outputs
-        _raw = model.generate(
-            **inputs_for_pred,
-            max_new_tokens=7,
-            do_sample=False,
-        )
-        _new_tokens = _raw[0, -7:].tolist()
-        print(f"[dbg] raw token IDs: {_new_tokens}")
-        action = model.predict_action(**inputs_for_pred, unnorm_key=unnorm_key, do_sample=False)
+        if action_head is not None:
+            # OFT single-pass inference.  The model's predict_action (from the
+            # checkpoint's OFT modeling_prismatic.py) signature is:
+            #   predict_action(input_ids, unnorm_key, action_head, **kwargs)
+            # where **kwargs carries pixel_values and attention_mask.
+            result = model.predict_action(
+                **inputs,
+                unnorm_key=unnorm_key,
+                action_head=action_head,
+                do_sample=False,
+            )
+            actions = result[0]  # (num_actions_chunk, 7) numpy array
+        else:
+            # Legacy token path: drop attention_mask (vision encoder expands
+            # sequence length beyond the text-only mask, causing a causal mask
+            # mismatch during generate()).
+            inputs_no_mask = {k: v for k, v in inputs.items() if k != "attention_mask"}
 
-    if hasattr(action, "cpu"):
-        action = action.cpu().numpy()
-    return [float(x) for x in action]
+            _pv = inputs_no_mask.get("pixel_values")
+            if _pv is not None:
+                _arr = _pv.float().cpu().numpy()
+                print(f"[dbg] pixel_values sum={_arr.sum():.1f} mean={_arr.mean():.4f}")
+
+            _raw = model.generate(**inputs_no_mask, max_new_tokens=7, do_sample=False)
+            print(f"[dbg] raw token IDs: {_raw[0, -7:].tolist()}")
+
+            actions = model.predict_action(**inputs_no_mask, unnorm_key=unnorm_key, do_sample=False)
+            if hasattr(actions, "cpu"):
+                actions = actions.cpu().numpy()
+            actions = np.atleast_2d(actions)  # (1, 7)
+
+    return [[float(x) for x in step] for step in np.atleast_2d(actions)]
 
 
 # ---------------------------------------------------------------------------
@@ -201,10 +451,18 @@ def main():
     args = parse_args()
 
     model, processor, device = load_model_and_processor(
-        args.checkpoint, args.base_model, args.dtype
+        args.checkpoint,
+        args.base_model,
+        args.dtype,
+        num_actions_chunk=args.num_actions_chunk,
+        merged_cache=args.merged_cache,
+        clear_cache=args.clear_cache,
     )
 
-    # Determine unnorm_key: from checkpoint stats if available, else from --unnorm-key arg
+    action_head = None
+    if args.checkpoint:
+        action_head = load_action_head(args.checkpoint, device, args.dtype)
+
     if args.checkpoint:
         stats_path = os.path.join(args.checkpoint, "dataset_statistics.json")
         with open(stats_path) as f:
@@ -212,13 +470,23 @@ def main():
         unnorm_key = list(dataset_stats.keys())[0]
     else:
         unnorm_key = args.unnorm_key
-    print(f"[server] unnorm_key = '{unnorm_key}'")
 
-    # ZMQ REP socket
+    print(f"[server] unnorm_key = '{unnorm_key}'")
+    if action_head is not None:
+        print(
+            f"[server] OFT mode | num_actions_chunk={args.num_actions_chunk} | "
+            f"open_loop_steps={args.open_loop_steps}"
+        )
+    else:
+        print("[server] Legacy token mode (no action head).")
+
     ctx = zmq.Context()
     socket = ctx.socket(zmq.REP)
     socket.bind(f"tcp://0.0.0.0:{args.port}")
     print(f"[server] Listening on port {args.port} ...")
+
+    # Open-loop buffer: holds pre-computed steps from the last inference call.
+    action_buffer: list[list[float]] = []
 
     step = 0
     while True:
@@ -227,7 +495,13 @@ def main():
             task = msg.get("task", unnorm_key)
             image = Image.open(BytesIO(base64.b64decode(msg["image"]))).convert("RGB")
 
-            action = run_inference(model, processor, image, task, unnorm_key, device)
+            if action_buffer:
+                action = action_buffer.pop(0)
+            else:
+                chunk = run_inference(model, processor, action_head, image, task, unnorm_key, device)
+                action = chunk[0]
+                if args.open_loop_steps > 1:
+                    action_buffer.extend(chunk[1:args.open_loop_steps])
 
             if step % 20 == 0:
                 print(f"[server] step={step} | action={np.round(action, 4)}")
@@ -240,7 +514,6 @@ def main():
             break
         except Exception as e:
             traceback.print_exc()
-            # Must reply before next recv
             try:
                 socket.send_json({"action": None, "status": f"error: {e}"})
             except Exception:
