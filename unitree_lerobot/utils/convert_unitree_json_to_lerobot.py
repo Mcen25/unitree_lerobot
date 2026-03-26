@@ -269,7 +269,7 @@ def create_empty_dataset(
 
     return LeRobotDataset.create(
         repo_id=repo_id,
-        fps=30,
+        fps=10,
         robot_type=robot_type,
         features=features,
         use_videos=dataset_config.use_videos,

@@ -152,16 +152,16 @@ def main():
         arm_ik = robot_interface["arm_ik"]
         ee_shared_mem = robot_interface["ee_shared_mem"]
 
-        # Default home pose from training data (episode_0117)
+        # Default home pose from training data (episode_0190)
         _HOME_Q = np.array([
             # left arm (7 DOF)
-            -0.37462687492370605,  0.05855492502450943,  0.18985410034656525,
-             0.6078758835792542,   0.09407617151737213, -0.9563771486282349,
-             0.09735984355211258,
+             0.402046799659729,   0.0664764940738678,   0.10903248190879822,
+            -0.13733921945095062, -0.22342191636562347, -0.6033697724342346,
+            -0.2659778892993927,
             # right arm (7 DOF)
-             0.1778099536895752,   0.09205083549022675, -1.2643357515335083,
-             1.3972288370132446,   1.1787084341049194,  -0.08017446845769882,
-            -0.09014534205198288,
+            -0.18102172017097473, -0.11210044473409653,  0.08644221723079681,
+             1.0941717624664307,  -0.1569933444261551,  -0.12699683010578156,
+             0.25151294469833374,
         ])
 
         # -- Move to home position --------------------------------------------
@@ -173,6 +173,13 @@ def main():
             arm_ctrl.ctrl_dual_arm(interp_q, np.zeros(len(interp_q)))
             time.sleep(0.01)
         logger_mp.info("Arm ready.")
+
+        # -- Open gripper at start -------------------------------------------
+        if ee_shared_mem:
+            left_mem = ee_shared_mem.get("left")
+            if left_mem is not None and hasattr(left_mem, "value"):
+                left_mem.value = 1.0
+                logger_mp.info("Gripper opened.")
 
         # -- User confirm ----------------------------------------------------
         user_input = input("Enter 's' to start evaluation: ").strip().lower()

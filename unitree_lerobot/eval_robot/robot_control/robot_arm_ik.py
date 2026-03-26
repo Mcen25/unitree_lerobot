@@ -25,11 +25,11 @@ class G1_29_ArmIK:
 
         if not self.Unit_Test:
             self.robot = pin.RobotWrapper.BuildFromURDF(
-                "unitree_lerobot/eval_robot/assets/g1/g1_body29_hand14.urdf", "unitree_lerobot/eval_robot/assets/g1/"
+                "/home/unitree/AlphaZ_WS/xr_teleoperate/assets/g1/g1_body29_hand14.urdf", "/home/unitree/AlphaZ_WS/xr_teleoperate/assets/g1/"
             )
         else:
             self.robot = pin.RobotWrapper.BuildFromURDF(
-                "unitree_lerobot/eval_robot/assets/g1/g1_body29_hand14.urdf", "unitree_lerobot/eval_robot/assets/g1/"
+                "/home/unitree/AlphaZ_WS/xr_teleoperate/assets/g1/g1_body29_hand14.urdf", "/home/unitree/AlphaZ_WS/xr_teleoperate/assets/g1/"
             )  # for test
 
         self.mixed_jointsToLockIDs = [
