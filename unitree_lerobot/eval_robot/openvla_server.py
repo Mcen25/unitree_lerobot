@@ -124,13 +124,18 @@ def make_prompt(task: str) -> str:
 # ---------------------------------------------------------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser(description="OpenVLA-OFT inference server")
+    p = argparse.ArgumentParser(description="OpenVLA inference server (standard or OFT)")
     p.add_argument(
         "--checkpoint",
         default=None,
-        help="Path to the OFT checkpoint directory (contains merged safetensors, "
-             "action_head--*_checkpoint.pt, dataset_statistics.json). "
-             "Omit to run the base model without an action head.",
+        help="Path to the checkpoint directory (merged safetensors + dataset_statistics.json). "
+             "Omit to run the base model.",
+    )
+    p.add_argument(
+        "--no-action-head",
+        action="store_true",
+        help="Skip loading the OFT action head and use standard token-based prediction instead. "
+             "Use this for standard OpenVLA (non-OFT) fine-tunes.",
     )
     p.add_argument(
         "--base-model",
@@ -460,8 +465,10 @@ def main():
     )
 
     action_head = None
-    if args.checkpoint:
+    if args.checkpoint and not args.no_action_head:
         action_head = load_action_head(args.checkpoint, device, args.dtype)
+    elif args.no_action_head:
+        print("[server] --no-action-head: skipping action head, using token-based prediction.")
 
     if args.checkpoint:
         stats_path = os.path.join(args.checkpoint, "dataset_statistics.json")
@@ -473,20 +480,17 @@ def main():
 
     print(f"[server] unnorm_key = '{unnorm_key}'")
     if action_head is not None:
-        print(
-            f"[server] OFT mode | num_actions_chunk={args.num_actions_chunk} | "
-            f"open_loop_steps={args.open_loop_steps}"
-        )
+        print(f"[server] OFT mode | num_actions_chunk={args.num_actions_chunk}")
     else:
-        print("[server] Legacy token mode (no action head).")
+        print("[server] Standard OpenVLA mode (token-based prediction).")
 
     ctx = zmq.Context()
     socket = ctx.socket(zmq.REP)
     socket.bind(f"tcp://0.0.0.0:{args.port}")
     print(f"[server] Listening on port {args.port} ...")
 
-    # Open-loop buffer: holds pre-computed steps from the last inference call.
-    action_buffer: list[list[float]] = []
+    # Chunk management and temporal ensembling are now handled client-side.
+    # The server always runs a fresh inference and returns the full chunk.
 
     step = 0
     while True:
@@ -495,19 +499,18 @@ def main():
             task = msg.get("task", unnorm_key)
             image = Image.open(BytesIO(base64.b64decode(msg["image"]))).convert("RGB")
 
-            if action_buffer:
-                action = action_buffer.pop(0)
-            else:
-                chunk = run_inference(model, processor, action_head, image, task, unnorm_key, device)
-                action = chunk[0]
-                if args.open_loop_steps > 1:
-                    action_buffer.extend(chunk[1:args.open_loop_steps])
+            chunk = run_inference(model, processor, action_head, image, task, unnorm_key, device)
 
             if step % 20 == 0:
-                print(f"[server] step={step} | action={np.round(action, 4)}")
+                print(f"[server] step={step} | action={np.round(chunk[0], 4)}")
             step += 1
 
-            socket.send_json({"action": action, "status": "ok"})
+            if action_head is not None:
+                # OFT: return full chunk for client-side temporal ensembling
+                socket.send_json({"actions": chunk, "status": "ok"})
+            else:
+                # Standard OpenVLA: return single action
+                socket.send_json({"action": chunk[0], "status": "ok"})
 
         except KeyboardInterrupt:
             print("[server] Shutting down.")
@@ -515,7 +518,7 @@ def main():
         except Exception as e:
             traceback.print_exc()
             try:
-                socket.send_json({"action": None, "status": f"error: {e}"})
+                socket.send_json({"actions": None, "status": f"error: {e}"})
             except Exception:
                 pass
 
