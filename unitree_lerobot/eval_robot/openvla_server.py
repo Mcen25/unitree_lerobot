@@ -1,19 +1,23 @@
 """
-OpenVLA-OFT inference server — run this on the Jetson Thor (or any CUDA machine).
+OpenVLA inference server — run this on the GPU machine (Jetson Thor or workstation).
 
-Loads openvla-7b + OFT fine-tune (L1RegressionActionHead), listens for image+task
-requests over ZMQ, and returns 7-DOF delta EE actions to the robot client.
+Supports two modes:
+  Standard OpenVLA (default): token-based autoregressive prediction, returns single action.
+  OpenVLA-OFT: action head (MLP) regression, returns full action chunk.
+
+Pass --no-action-head to force standard mode even if the checkpoint contains an action head.
 
 The checkpoint directory must contain:
-  - model-*.safetensors          merged (base + LoRA) model weights
-  - action_head--*_checkpoint.pt L1RegressionActionHead weights
-  - dataset_statistics.json      action normalization statistics
-  - modeling_prismatic.py        OFT-extended model code (auto-synced from training)
+  - model-*.safetensors / model.safetensors   merged model weights (OFT checkpoints)
+  - dataset_statistics.json                   action normalization statistics
+  - [OFT only] action_head--*_checkpoint.pt   L1RegressionActionHead weights
+  - [OFT only] modeling_prismatic.py          OFT model code (trust_remote_code)
 
 Usage (Jetson Thor):
     conda activate <env>
     python openvla_server.py \\
-        --checkpoint /path/to/openvla-7b+orange_in_black_box_4+... \\
+        --checkpoint /path/to/openvla-7b+pick_up_bottle_1+... \\
+        --no-action-head \\
         --port 5555
 
 Notes for Jetson Thor (aarch64):
@@ -427,18 +431,10 @@ def run_inference(
             )
             actions = result[0]  # (num_actions_chunk, 7) numpy array
         else:
-            # Legacy token path: drop attention_mask (vision encoder expands
+            # Standard token path: drop attention_mask (vision encoder expands
             # sequence length beyond the text-only mask, causing a causal mask
             # mismatch during generate()).
             inputs_no_mask = {k: v for k, v in inputs.items() if k != "attention_mask"}
-
-            _pv = inputs_no_mask.get("pixel_values")
-            if _pv is not None:
-                _arr = _pv.float().cpu().numpy()
-                print(f"[dbg] pixel_values sum={_arr.sum():.1f} mean={_arr.mean():.4f}")
-
-            _raw = model.generate(**inputs_no_mask, max_new_tokens=7, do_sample=False)
-            print(f"[dbg] raw token IDs: {_raw[0, -7:].tolist()}")
 
             actions = model.predict_action(**inputs_no_mask, unnorm_key=unnorm_key, do_sample=False)
             if hasattr(actions, "cpu"):

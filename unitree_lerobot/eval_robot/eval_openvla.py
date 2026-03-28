@@ -138,10 +138,13 @@ def inference_worker(
             logger_mp.warning(f"[inference] Server error: {resp.get('status')}")
             continue
 
-        raw = resp.get("actions") or ([resp["action"]] if resp.get("action") else None)
-        if raw is None:
+        if "actions" in resp:
+            chunk = np.array(resp["actions"], dtype=np.float64)
+        elif "action" in resp:
+            chunk = np.array([resp["action"]], dtype=np.float64)
+        else:
+            logger_mp.warning("[inference] Server response missing action — skipping.")
             continue
-        chunk = np.array(raw, dtype=np.float64)
 
         with buffer_lock:
             buffer.append((chunk, pred_step))
@@ -162,7 +165,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="OpenVLA robot eval (robot side)")
     p.add_argument("--server-host", default="192.168.123.162")
     p.add_argument("--server-port", type=int, default=5555)
-    p.add_argument("--task", default="pick up the orange bottle and put it in the black box")
+    p.add_argument("--task", default="pick up the bottle")
     p.add_argument("--arm", default="G1_29", choices=["G1_29", "G1_23"])
     p.add_argument("--ee", default="inspire_ftp")
     p.add_argument("--action-scale", type=float, default=1.0,
@@ -191,14 +194,14 @@ def parse_args():
 # ---------------------------------------------------------------------------
 
 _HOME_Q = np.array([
-    # left arm (7 DOF) — episode_0033 frame 0
-     0.3927501978988448,  -0.005632476526715517,  0.047096701881357644,
-    -0.41113749204796995,  0.1807073597099622,   -0.6146751848814046,
-     0.04119819118506424,
+    # left arm (7 DOF) — pick_up_bottle episode_0000 frame 0
+    -0.34645387900173014,  0.1524184111947297,   0.25369699691062836,
+     1.057249934415636,   -0.24402274281836966,  -0.7911240834670821,
+    -0.5561958637606049,
     # right arm (7 DOF)
-    -0.37670122639527814, -0.14609176253092604,  -0.014642830131267721,
-     1.3952594342819227,  -0.3987154953992208,    0.1006491992615599,
-     0.01619944107577735,
+    -0.34000100225575725, -0.006998843201230316, -0.18242628091648888,
+     1.3728139458298765,  -0.1709973596286498,   -0.021230809117383932,
+     0.07025685867799826,
 ])
 
 
@@ -359,7 +362,13 @@ def main():
                     logger_mp.warning(f"Server error: {resp.get('status')}")
                     continue
 
-                action = np.array(resp.get("action") or resp["actions"][0], dtype=np.float64)
+                if "action" in resp:
+                    action = np.array(resp["action"], dtype=np.float64)
+                elif "actions" in resp:
+                    action = np.array(resp["actions"][0], dtype=np.float64)
+                else:
+                    logger_mp.warning("Server response missing action — skipping step.")
+                    continue
 
                 L_ee, target_L, gripper_val = apply_action(
                     action, arm_ik, arm_ctrl, ee_shared_mem, args.action_scale
