@@ -120,7 +120,7 @@ def _inject_prismatic_stubs(num_actions_chunk: int = 8) -> None:
 # ---------------------------------------------------------------------------
 
 def make_prompt(task: str) -> str:
-    return f"In: What action should the robot take to {task}?\nOut:"
+    return f"In: What action should the robot take to {task.lower()}?\nOut:"
 
 
 # ---------------------------------------------------------------------------
@@ -431,12 +431,10 @@ def run_inference(
             )
             actions = result[0]  # (num_actions_chunk, 7) numpy array
         else:
-            # Standard token path: drop attention_mask (vision encoder expands
-            # sequence length beyond the text-only mask, causing a causal mask
-            # mismatch during generate()).
-            inputs_no_mask = {k: v for k, v in inputs.items() if k != "attention_mask"}
-
-            actions = model.predict_action(**inputs_no_mask, unnorm_key=unnorm_key, do_sample=False)
+            # Standard token path: pass full inputs including attention_mask.
+            # The model's forward() extends the mask to cover visual tokens internally
+            # (see modeling_prismatic.py: multimodal_attention_mask construction).
+            actions = model.predict_action(**inputs, unnorm_key=unnorm_key, do_sample=False)
             if hasattr(actions, "cpu"):
                 actions = actions.cpu().numpy()
             actions = np.atleast_2d(actions)  # (1, 7)
