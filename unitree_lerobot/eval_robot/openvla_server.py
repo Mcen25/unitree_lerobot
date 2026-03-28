@@ -431,10 +431,14 @@ def run_inference(
             )
             actions = result[0]  # (num_actions_chunk, 7) numpy array
         else:
-            # Standard token path: pass full inputs including attention_mask.
-            # The model's forward() extends the mask to cover visual tokens internally
-            # (see modeling_prismatic.py: multimodal_attention_mask construction).
-            actions = model.predict_action(**inputs, unnorm_key=unnorm_key, do_sample=False)
+            # Standard token path: drop attention_mask before calling generate().
+            # The text-only attention_mask has shape (1, text_len), but after visual
+            # token injection the sequence length is text_len+1. HuggingFace's generate()
+            # builds a causal mask from the original attention_mask size, causing a size
+            # mismatch in LLaMA attention. Dropping it lets the model use a full causal
+            # mask (all ones), which is correct for a single-sample batch.
+            inputs_no_mask = {k: v for k, v in inputs.items() if k != "attention_mask"}
+            actions = model.predict_action(**inputs_no_mask, unnorm_key=unnorm_key, do_sample=False)
             if hasattr(actions, "cpu"):
                 actions = actions.cpu().numpy()
             actions = np.atleast_2d(actions)  # (1, 7)
