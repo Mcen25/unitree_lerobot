@@ -1,6 +1,9 @@
 """
 OpenVLA eval script for G1 robot with Inspire FTP gripper.
 
+Supports both standard OpenVLA (token-based, closed-loop) and OpenVLA-OFT
+(action head + chunking + temporal ensembling). Pass --oft to enable OFT mode.
+
 OpenVLA outputs 7-DOF delta end-effector actions:
     [dx, dy, dz, d_roll, d_pitch, d_yaw, gripper]
 for the LEFT arm. Right arm stays at current position.
@@ -178,8 +181,6 @@ def parse_args():
     p.add_argument("--motion", action="store_true")
     p.add_argument("--img-host", default="192.168.123.164")
     p.add_argument("--img-port", type=int, default=55555)
-    p.add_argument("--video-dir", default="/tmp",
-                   help="Directory to save the eval video (default: /tmp)")
     args = p.parse_args()
     args.sim = not args.send_real_robot
     return args
@@ -242,8 +243,6 @@ def main():
     args = parse_args()
 
     tv_img_shm = None
-    video_writer = None
-    video_stop = threading.Event()
     stop_event = threading.Event()
     try:
         # -- Camera ----------------------------------------------------------
@@ -295,31 +294,6 @@ def main():
         time.sleep(1.0)
         cv2.imwrite("/tmp/eval_openvla_frame0.jpg", tv_img_array.copy())
         logger_mp.info("Saved first frame to /tmp/eval_openvla_frame0.jpg")
-
-        # -- Video recording -------------------------------------------------
-        os.makedirs(args.video_dir, exist_ok=True)
-        task_slug = args.task.replace(" ", "_")[:40]
-        video_path = os.path.join(
-            args.video_dir,
-            f"eval_openvla_{time.strftime('%Y%m%d_%H%M%S')}_{task_slug}.mp4",
-        )
-        video_writer = cv2.VideoWriter(
-            video_path,
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            15,
-            (tv_img_shape[1], tv_img_shape[0]),  # (width, height)
-        )
-
-        def _record_frames():
-            interval = 1.0 / 15
-            while not video_stop.is_set():
-                t = time.perf_counter()
-                video_writer.write(tv_img_array.copy())
-                elapsed = time.perf_counter() - t
-                time.sleep(max(0.0, interval - elapsed))
-
-        threading.Thread(target=_record_frames, daemon=True).start()
-        logger_mp.info(f"Recording video to {video_path}")
 
         # ====================================================================
         # OFT mode: background inference + temporal ensembling
@@ -434,10 +408,6 @@ def main():
         traceback.print_exc()
     finally:
         stop_event.set()
-        video_stop.set()
-        if video_writer is not None:
-            video_writer.release()
-            logger_mp.info(f"Video saved to {video_path}")
         if tv_img_shm is not None:
             try:
                 tv_img_shm.close()

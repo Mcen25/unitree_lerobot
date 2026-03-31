@@ -26,6 +26,8 @@ from pathlib import Path
 from collections import defaultdict
 from typing import Literal
 
+import pyarrow.parquet as pq
+from huggingface_hub import HfApi, hf_hub_download
 from lerobot.utils.constants import HF_LEROBOT_HOME
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -341,6 +343,45 @@ def json_to_lerobot(
 
     if push_to_hub:
         dataset.push_to_hub(upload_large_folder=True)
+        _verify_hub_parquets(repo_id, HF_LEROBOT_HOME / repo_id)
+
+
+def _verify_hub_parquets(repo_id: str, root_path: Path, max_retries: int = 3) -> None:
+    """Download each parquet from HF and verify it is valid. Retry upload on failure."""
+    hub_api = HfApi()
+    parquet_files = sorted(root_path.glob("data/**/*.parquet"))
+    if not parquet_files:
+        print("No parquet files found locally to verify.")
+        return
+
+    print(f"Verifying {len(parquet_files)} parquet file(s) on HuggingFace...")
+    for local_path in parquet_files:
+        rel = local_path.relative_to(root_path)
+        for attempt in range(1, max_retries + 1):
+            try:
+                buf = hf_hub_download(
+                    repo_id=repo_id,
+                    filename=str(rel),
+                    repo_type="dataset",
+                    force_download=True,
+                )
+                pq.read_table(buf)
+                print(f"  OK: {rel}")
+                break
+            except Exception as e:
+                print(f"  CORRUPTED (attempt {attempt}/{max_retries}): {rel} — {e}")
+                if attempt < max_retries:
+                    print(f"  Re-uploading {rel} ...")
+                    hub_api.upload_file(
+                        path_or_fileobj=str(local_path),
+                        path_in_repo=str(rel),
+                        repo_id=repo_id,
+                        repo_type="dataset",
+                    )
+                else:
+                    raise RuntimeError(
+                        f"Parquet {rel} is still corrupted on HuggingFace after {max_retries} attempts."
+                    )
 
 
 def local_push_to_hub(
@@ -349,6 +390,7 @@ def local_push_to_hub(
 ):
     dataset = LeRobotDataset(repo_id=repo_id, root=root_path)
     dataset.push_to_hub(upload_large_folder=True)
+    _verify_hub_parquets(repo_id, root_path)
 
 
 if __name__ == "__main__":
