@@ -1,9 +1,13 @@
 """
-OpenVLA inference server — run this on the GPU machine (Jetson Thor or workstation).
+OpenVLA inference server with V-GPS multi-sample support.
 
-Supports two modes:
+Supports three modes:
   Standard OpenVLA (default): token-based autoregressive prediction, returns single action.
   OpenVLA-OFT: action head (MLP) regression, returns full action chunk.
+  V-GPS: sample N actions with temperature for client-side Cal-QL value scoring.
+
+For V-GPS, the client sends {"image": ..., "task": ..., "num_samples": N, "sample_temperature": T}.
+The server returns {"actions": [[...], ...], "status": "ok"} with N 7-DOF action arrays.
 
 Pass --no-action-head to force standard mode even if the checkpoint contains an action head.
 
@@ -15,7 +19,7 @@ The checkpoint directory must contain:
 
 Usage (Jetson Thor):
     conda activate <env>
-    python openvla_server.py \\
+    python openvla_server_v_gps.py \\
         --checkpoint /path/to/openvla-7b+pick_up_bottle_1+... \\
         --no-action-head \\
         --port 5555
@@ -382,6 +386,21 @@ def load_action_head(checkpoint_path: str, device: str, dtype_str: str):
 # Inference
 # ---------------------------------------------------------------------------
 
+def _prepare_inputs(model, processor, image, task, device):
+    """Prepare model inputs once, reusable for multiple sampling passes."""
+    prompt = make_prompt(task)
+    inputs = processor(prompt, image)
+    inputs = {
+        k: (
+            v.to(device, dtype=model.dtype) if (hasattr(v, "to") and v.is_floating_point())
+            else v.to(device) if hasattr(v, "to")
+            else v
+        )
+        for k, v in inputs.items()
+    }
+    return {k: v for k, v in inputs.items() if k != "attention_mask"}
+
+
 def run_inference(
     model,
     processor,
@@ -496,16 +515,35 @@ def main():
             msg = socket.recv_json()
             task = msg.get("task", unnorm_key)
             image = Image.open(BytesIO(base64.b64decode(msg["image"]))).convert("RGB")
-
-            chunk = run_inference(model, processor, action_head, image, task, unnorm_key, device)
-            if step % 20 == 0:
-                print(f"[server] step={step} | action={np.round(chunk[0], 4)}")
+            num_samples = int(msg.get("num_samples", 1))
+            sample_temperature = float(msg.get("sample_temperature", 1.5))
 
             if action_head is not None:
                 # OFT: return full chunk for client-side temporal ensembling
+                chunk = run_inference(model, processor, action_head, image, task, unnorm_key, device)
+                if step % 20 == 0:
+                    print(f"[server] step={step} | action={np.round(chunk[0], 4)}")
                 socket.send_json({"actions": chunk, "status": "ok"})
+            elif num_samples > 1:
+                # V-GPS: sample N actions with temperature for client-side value scoring
+                inputs_no_mask = _prepare_inputs(model, processor, image, task, device)
+                sampled = []
+                import torch
+                with torch.no_grad():
+                    for _ in range(num_samples):
+                        a = model.predict_action(**inputs_no_mask, unnorm_key=unnorm_key,
+                                                 do_sample=True, temperature=sample_temperature)
+                        if hasattr(a, "cpu"):
+                            a = a.cpu().numpy()
+                        sampled.append([float(x) for x in np.atleast_1d(a).flatten()[:7]])
+                if step % 20 == 0:
+                    print(f"[server] step={step} | V-GPS {num_samples} samples | first={np.round(sampled[0], 4)}")
+                socket.send_json({"actions": sampled, "status": "ok"})
             else:
                 # Standard OpenVLA: return single action
+                chunk = run_inference(model, processor, action_head, image, task, unnorm_key, device)
+                if step % 20 == 0:
+                    print(f"[server] step={step} | action={np.round(chunk[0], 4)}")
                 socket.send_json({"action": chunk[0], "status": "ok"})
 
         except KeyboardInterrupt:

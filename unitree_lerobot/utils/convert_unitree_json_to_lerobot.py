@@ -343,7 +343,31 @@ def json_to_lerobot(
 
     if push_to_hub:
         dataset.push_to_hub(upload_large_folder=True)
+        _reupload_parquets(repo_id, HF_LEROBOT_HOME / repo_id)
         _verify_hub_parquets(repo_id, HF_LEROBOT_HOME / repo_id)
+
+
+def _reupload_parquets(repo_id: str, root_path: Path) -> None:
+    """Re-upload all local parquet files directly via upload_file.
+
+    upload_large_folder uses Xet chunked transfer which can corrupt small
+    parquet files. Uploading them again with upload_file fixes this.
+    """
+    hub_api = HfApi()
+    parquet_files = sorted(root_path.glob("**/*.parquet"))
+    if not parquet_files:
+        return
+    print(f"Re-uploading {len(parquet_files)} parquet file(s) directly to avoid Xet corruption...")
+    for local_path in parquet_files:
+        rel = local_path.relative_to(root_path)
+        hub_api.upload_file(
+            path_or_fileobj=str(local_path),
+            path_in_repo=str(rel),
+            repo_id=repo_id,
+            repo_type="dataset",
+            commit_message=f"Re-upload {rel} via upload_file (Xet bypass)",
+        )
+        print(f"  uploaded: {rel}")
 
 
 def _verify_hub_parquets(repo_id: str, root_path: Path, max_retries: int = 3) -> None:
@@ -390,6 +414,7 @@ def local_push_to_hub(
 ):
     dataset = LeRobotDataset(repo_id=repo_id, root=root_path)
     dataset.push_to_hub(upload_large_folder=True)
+    _reupload_parquets(repo_id, root_path)
     _verify_hub_parquets(repo_id, root_path)
 
 

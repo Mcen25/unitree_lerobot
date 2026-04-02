@@ -22,7 +22,6 @@ import os
 import threading
 import time
 import traceback
-from multiprocessing import shared_memory
 
 import cv2
 import numpy as np
@@ -34,7 +33,7 @@ import logging_mp
 logging_mp.basic_config(level=logging_mp.INFO)
 logger_mp = logging_mp.get_logger(__name__)
 
-from unitree_lerobot.eval_robot.image_server.image_client import ImageClient
+from teleimager.image_client import ImageClient
 from unitree_lerobot.eval_robot.make_robot import setup_robot_interface
 
 
@@ -98,7 +97,7 @@ def inference_worker(
     server_host: str,
     server_port: int,
     task: str,
-    tv_img_array: np.ndarray,
+    img_client: ImageClient,
     buffer: list,
     buffer_lock: threading.Lock,
     exec_step_ref: list,
@@ -114,7 +113,11 @@ def inference_worker(
     logger_mp.info(f"[inference] Connected to {server_host}:{server_port}")
 
     while not stop_event.is_set():
-        img_b64 = encode_image_jpeg(tv_img_array.copy())
+        head_img, _ = img_client.get_head_frame()
+        if head_img is None:
+            time.sleep(0.01)
+            continue
+        img_b64 = encode_image_jpeg(head_img)
         with buffer_lock:
             pred_step = exec_step_ref[0]
         try:
@@ -177,7 +180,8 @@ def parse_args():
     p.add_argument("--send-real-robot", action="store_true")
     p.add_argument("--motion", action="store_true")
     p.add_argument("--img-host", default="192.168.123.164")
-    p.add_argument("--img-port", type=int, default=55555)
+    p.add_argument("--img-request-port", type=int, default=60000,
+                   help="Port for teleimager config requester (default: 60000)")
     p.add_argument("--video-dir", default="/tmp",
                    help="Directory to save the eval video (default: /tmp)")
     args = p.parse_args()
@@ -226,7 +230,8 @@ def apply_action(action, arm_ik, arm_ctrl, ee_shared_mem, action_scale):
     arm_ctrl.ctrl_dual_arm(sol_q, sol_tau)
     # Training gripper range 0–0.5, controller expects 0–1
     gripper_val = float(np.clip(physical[6] * 2.0, 0.0, 1.0))
-    # gripper_val = gripper_filter.filter(gripper_val)
+    if gripper_val < 0.7:
+        gripper_val = 0.0
     if ee_shared_mem:
         left_mem = ee_shared_mem.get("left")
         if left_mem is not None and hasattr(left_mem, "value"):
@@ -241,25 +246,17 @@ def apply_action(action, arm_ik, arm_ctrl, ee_shared_mem, action_scale):
 def main():
     args = parse_args()
 
-    tv_img_shm = None
-    video_writer = None
+    video_writer_head = None
+    video_writer_down = None
     video_stop = threading.Event()
     stop_event = threading.Event()
+    img_client = None
     try:
         # -- Camera ----------------------------------------------------------
-        tv_img_shape = (480, 640, 3)
-        tv_img_shm = shared_memory.SharedMemory(
-            create=True, size=int(np.prod(tv_img_shape)) * np.uint8().itemsize
-        )
-        tv_img_array = np.ndarray(tv_img_shape, dtype=np.uint8, buffer=tv_img_shm.buf)
-        img_client = ImageClient(
-            tv_img_shape=tv_img_shape,
-            tv_img_shm_name=tv_img_shm.name,
-            server_address=args.img_host,
-            port=args.img_port,
-        )
-        threading.Thread(target=img_client.receive_process, daemon=True).start()
-        logger_mp.info(f"Image client connecting to {args.img_host}:{args.img_port} ...")
+        img_client = ImageClient(host=args.img_host, request_port=args.img_request_port)
+        cam_config = img_client.get_cam_config()
+        logger_mp.info(f"Image client connected to {args.img_host}:{args.img_request_port}")
+        logger_mp.info(f"Camera config: {list(cam_config.keys())}")
 
         # -- Robot -----------------------------------------------------------
         robot_interface = setup_robot_interface(args)
@@ -303,18 +300,29 @@ def main():
             args.video_dir,
             f"eval_openvla_{time.strftime('%Y%m%d_%H%M%S')}_{task_slug}.mp4",
         )
-        video_writer = cv2.VideoWriter(
-            video_path,
+        video_writer_head = cv2.VideoWriter(
+            video_path.replace(".mp4", "_head.mp4"),
             cv2.VideoWriter_fourcc(*"mp4v"),
             15,
-            (tv_img_shape[1], tv_img_shape[0]),  # (width, height)
+            (640, 480),
+        )
+        video_writer_down = cv2.VideoWriter(
+            video_path.replace(".mp4", "_down.mp4"),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            15,
+            (640, 480),
         )
 
         def _record_frames():
             interval = 1.0 / 15
             while not video_stop.is_set():
                 t = time.perf_counter()
-                video_writer.write(tv_img_array.copy())
+                head, _ = img_client.get_head_frame()
+                down, _ = img_client.get_down_frame()
+                if head is not None:
+                    video_writer_head.write(head)
+                if down is not None:
+                    video_writer_down.write(down)
                 elapsed = time.perf_counter() - t
                 time.sleep(max(0.0, interval - elapsed))
 
@@ -333,7 +341,7 @@ def main():
             threading.Thread(
                 target=inference_worker,
                 args=(args.server_host, args.server_port, args.task,
-                      tv_img_array, ensemble_buffer, buffer_lock,
+                      img_client, ensemble_buffer, buffer_lock,
                       exec_step_ref, first_chunk_event, stop_event,
                       args.chunk_size),
                 daemon=True,
@@ -361,18 +369,16 @@ def main():
                     continue
 
                 L_ee, target_L, gripper_val = apply_action(
-                    action, arm_ik, arm_ctrl, ee_shared_mem, action_scale, gripper_filter
+                    action, arm_ik, arm_ctrl, ee_shared_mem, action_scale
                 )
 
-                if step % 5 == 0:
-                    with buffer_lock:
-                        n_chunks = len(ensemble_buffer)
-                    logger_mp.info(
-                        f"[step {step}] action={np.round(action, 4)} | "
-                        f"L_pos {np.round(L_ee[:3,3],3)} -> {np.round(target_L[:3,3],3)} | "
-                        f"gripper={gripper_val:.2f} | buf={n_chunks} | "
-                        f"ik={int((time.perf_counter()-t0)*1000)}ms"
-                    )
+                with buffer_lock:
+                    n_chunks = len(ensemble_buffer)
+                logger_mp.info(
+                    f"[step {step}] dz={action[2]:.4f} gripper={gripper_val:.2f} | "
+                    f"L_pos {np.round(L_ee[:3,3],3)} -> {np.round(target_L[:3,3],3)} | "
+                    f"buf={n_chunks} | ik={int((time.perf_counter()-t0)*1000)}ms"
+                )
                 step += 1
 
         # ====================================================================
@@ -392,7 +398,12 @@ def main():
             while True:
                 t0 = time.perf_counter()
 
-                img_b64 = encode_image_jpeg(tv_img_array.copy())
+                head_img, _ = img_client.get_head_frame()
+                down_img, _ = img_client.get_down_frame()
+                if head_img is None:
+                    logger_mp.warning("Head frame not ready — skipping step.")
+                    continue
+                img_b64 = encode_image_jpeg(head_img)
                 try:
                     socket.send_json({"image": img_b64, "task": args.task})
                     resp = socket.recv_json()
@@ -416,13 +427,11 @@ def main():
                     action, arm_ik, arm_ctrl, ee_shared_mem, action_scale
                 )
 
-                if step % 5 == 0:
-                    logger_mp.info(
-                        f"[step {step}] action={np.round(action, 4)} | "
-                        f"L_pos {np.round(L_ee[:3,3],3)} -> {np.round(target_L[:3,3],3)} | "
-                        f"gripper={gripper_val:.2f} | "
-                        f"ik={int((time.perf_counter()-t0)*1000)}ms"
-                    )
+                logger_mp.info(
+                    f"[step {step}] dz={action[2]:.4f} gripper={gripper_val:.2f} | "
+                    f"L_pos {np.round(L_ee[:3,3],3)} -> {np.round(target_L[:3,3],3)} | "
+                    f"ik={int((time.perf_counter()-t0)*1000)}ms"
+                )
                 step += 1
 
                 elapsed = time.perf_counter() - t0
@@ -435,15 +444,14 @@ def main():
     finally:
         stop_event.set()
         video_stop.set()
-        if video_writer is not None:
-            video_writer.release()
-            logger_mp.info(f"Video saved to {video_path}")
-        if tv_img_shm is not None:
-            try:
-                tv_img_shm.close()
-                tv_img_shm.unlink()
-            except Exception:
-                pass
+        if video_writer_head is not None:
+            video_writer_head.release()
+            logger_mp.info(f"Head video saved to {video_path.replace('.mp4', '_head.mp4')}")
+        if video_writer_down is not None:
+            video_writer_down.release()
+            logger_mp.info(f"Down video saved to {video_path.replace('.mp4', '_down.mp4')}")
+        if img_client is not None:
+            img_client.close()
         logger_mp.info("End of eval.")
 
 
