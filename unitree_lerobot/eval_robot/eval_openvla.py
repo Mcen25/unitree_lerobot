@@ -24,6 +24,9 @@ import time
 import traceback
 
 import cv2
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pinocchio as pin
 import zmq
@@ -62,6 +65,48 @@ def apply_delta_ee(current_4x4: np.ndarray, delta_xyz: np.ndarray, delta_rpy: np
     return target
 
 
+def simulate_chunk_trajectory(L_ee_start: np.ndarray, chunk: np.ndarray, action_scale: float) -> np.ndarray:
+    """Forward-simulate a chunk of delta actions from L_ee_start.
+    Returns array of shape (k+1, 3) — start position + one position per action step.
+    """
+    poses = [L_ee_start[:3, 3].copy()]
+    pose = L_ee_start.copy()
+    for action in chunk:
+        physical = action.copy()
+        physical[:6] *= action_scale
+        pose = apply_delta_ee(pose, physical[:3], physical[3:6])
+        poses.append(pose[:3, 3].copy())
+    return np.array(poses)
+
+
+def save_trajectory_plot(planned_trajs: list, actual_positions: list, out_path: str):
+    """Save a 3D plot of all VLA-planned trajectories and the actual executed path."""
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection="3d")
+
+    cmap = plt.get_cmap("cool")
+    n = len(planned_trajs)
+    for i, traj in enumerate(planned_trajs):
+        color = cmap(i / max(n - 1, 1))
+        ax.plot(traj[:, 0], traj[:, 1], traj[:, 2], color=color, alpha=0.4, linewidth=1)
+        ax.scatter(traj[0, 0], traj[0, 1], traj[0, 2], color=color, s=10)
+
+    if actual_positions:
+        actual = np.array(actual_positions)
+        ax.plot(actual[:, 0], actual[:, 1], actual[:, 2], "r-", linewidth=2, label="executed")
+        ax.scatter(*actual[0], color="green", s=50, zorder=5, label="start")
+        ax.scatter(*actual[-1], color="red", s=50, zorder=5, label="end")
+
+    ax.set_xlabel("X (m)")
+    ax.set_ylabel("Y (m)")
+    ax.set_zlabel("Z (m)")
+    ax.set_title(f"VLA planned trajectories (n={n})")
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
 # ---------------------------------------------------------------------------
 # Image encoding
 # ---------------------------------------------------------------------------
@@ -72,82 +117,10 @@ def encode_image_jpeg(img_bgr: np.ndarray, quality: int = 85) -> str:
     return base64.b64encode(buf.tobytes()).decode()
 
 
-# ---------------------------------------------------------------------------
-# OFT: Temporal ensembling + background inference worker
-# ---------------------------------------------------------------------------
-
-def temporal_ensemble(
-    buffer: list,
-    current_step: int,
-    lam: float = 0.01,
-) -> np.ndarray | None:
-    """Average overlapping chunk predictions weighted by recency (exp(-lam * age))."""
-    weighted = np.zeros(7)
-    total_w = 0.0
-    for chunk, pred_step in buffer:
-        idx = current_step - pred_step
-        if 0 <= idx < len(chunk):
-            w = np.exp(-lam * idx)
-            weighted += w * chunk[idx]
-            total_w += w
-    return weighted / total_w if total_w > 1e-9 else None
-
-
-def inference_worker(
-    server_host: str,
-    server_port: int,
-    task: str,
-    img_client: ImageClient,
-    buffer: list,
-    buffer_lock: threading.Lock,
-    exec_step_ref: list,
-    first_chunk_event: threading.Event,
-    stop_event: threading.Event,
-    max_buffer: int = 8,
-):
-    """OFT background inference thread — continuously fetches action chunks."""
-    ctx = zmq.Context()
-    socket = ctx.socket(zmq.REQ)
-    socket.connect(f"tcp://{server_host}:{server_port}")
-    socket.setsockopt(zmq.RCVTIMEO, 15000)
-    logger_mp.info(f"[inference] Connected to {server_host}:{server_port}")
-
-    while not stop_event.is_set():
-        head_img, _ = img_client.get_head_frame()
-        if head_img is None:
-            time.sleep(0.01)
-            continue
-        img_b64 = encode_image_jpeg(head_img)
-        with buffer_lock:
-            pred_step = exec_step_ref[0]
-        try:
-            socket.send_json({"image": img_b64, "task": task})
-            resp = socket.recv_json()
-        except zmq.Again:
-            logger_mp.warning("[inference] Server timeout — retrying.")
-            continue
-
-        if resp.get("status") != "ok":
-            logger_mp.warning(f"[inference] Server error: {resp.get('status')}")
-            continue
-
-        if "actions" in resp:
-            chunk = np.array(resp["actions"], dtype=np.float64)
-        elif "action" in resp:
-            chunk = np.array([resp["action"]], dtype=np.float64)
-        else:
-            logger_mp.warning("[inference] Server response missing action — skipping.")
-            continue
-
-        with buffer_lock:
-            buffer.append((chunk, pred_step))
-            while len(buffer) > max_buffer:
-                buffer.pop(0)
-            first_chunk_event.set()
-
-    socket.close()
-    ctx.term()
-    logger_mp.info("[inference] Worker stopped.")
+def get_policy_frame(img_client: ImageClient) -> tuple[np.ndarray | None, str | None]:
+    """Get frame for policy inference from head camera."""
+    frame, _ = img_client.get_head_frame()
+    return frame, "head" if frame is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -167,14 +140,6 @@ def parse_args():
                         "to compensate for frequency mismatch.")
     p.add_argument("--training-fps", type=float, default=10.0,
                    help="FPS the model was trained at (default 10). Used to compute default action-scale.")
-    # OFT-specific
-    p.add_argument("--oft", action="store_true",
-                   help="Enable OFT mode: background inference thread + temporal ensembling")
-    p.add_argument("--chunk-size", type=int, default=8,
-                   help="[OFT] Action chunk size (match --num-actions-chunk on server)")
-    p.add_argument("--ensemble-lambda", type=float, default=0.01,
-                   help="[OFT] Temporal ensemble decay rate")
-    # Standard mode frequency control
     p.add_argument("--frequency", type=float, default=5.0,
                    help="[Standard] Control frequency in Hz")
     p.add_argument("--send-real-robot", action="store_true")
@@ -195,7 +160,7 @@ def parse_args():
 
 _HOME_Q = np.array([
     # left arm (7 DOF) — pick_up_bottle episode_0100 frame 0
-        -0.3494240641593933,
+                         -0.3494240641593933,
                         0.06934072822332382,
                         0.08838365972042084,
                         0.9953857660293579,
@@ -203,9 +168,13 @@ _HOME_Q = np.array([
                         -0.8925731182098389,
                         -0.18670225143432617,
     # right arm (7 DOF)
-    -0.2933139204978943,  -0.1350741982460022,  -0.20893298089504242,
-     1.3649553060531616,  -0.07726229727268219,  0.029828736558556557,
-     0.052934322506189346,
+    0.03721101954579353,
+                        -0.10063154250383377,
+                        -0.034023214131593704,
+                        1.1916035413742065,
+                        -0.04767324775457382,
+                        -0.00794554129242897,
+                        -0.01378185860812664,
 ])
 
 
@@ -247,10 +216,10 @@ def main():
     args = parse_args()
 
     video_writer_head = None
-    video_writer_down = None
     video_stop = threading.Event()
-    stop_event = threading.Event()
     img_client = None
+    planned_trajs: list = []
+    actual_positions: list = []
     try:
         # -- Camera ----------------------------------------------------------
         img_client = ImageClient(host=args.img_host, request_port=args.img_request_port)
@@ -289,9 +258,18 @@ def main():
         logger_mp.info(f"action_scale={action_scale:.2f} (training {args.training_fps}Hz / eval {args.frequency}Hz)")
         # gripper_filter = GripperHysteresis()
 
-        time.sleep(1.0)
-        cv2.imwrite("/tmp/eval_openvla_frame0.jpg", tv_img_array.copy())
-        logger_mp.info("Saved first frame to /tmp/eval_openvla_frame0.jpg")
+        time.sleep(0.5)
+        frame0, frame0_src = None, None
+        warmup_deadline = time.time() + 3.0
+        while time.time() < warmup_deadline and frame0 is None:
+            frame0, frame0_src = get_policy_frame(img_client)
+            if frame0 is None:
+                time.sleep(0.02)
+        if frame0 is not None:
+            cv2.imwrite("/tmp/eval_openvla_frame0.jpg", frame0.copy())
+            logger_mp.info(f"Saved first frame ({frame0_src}) to /tmp/eval_openvla_frame0.jpg")
+        else:
+            logger_mp.warning("Policy frame not ready after warmup; skipped saving /tmp/eval_openvla_frame0.jpg")
 
         # -- Video recording -------------------------------------------------
         os.makedirs(args.video_dir, exist_ok=True)
@@ -306,150 +284,89 @@ def main():
             15,
             (640, 480),
         )
-        video_writer_down = cv2.VideoWriter(
-            video_path.replace(".mp4", "_down.mp4"),
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            15,
-            (640, 480),
-        )
-
         def _record_frames():
             interval = 1.0 / 15
             while not video_stop.is_set():
                 t = time.perf_counter()
                 head, _ = img_client.get_head_frame()
-                down, _ = img_client.get_down_frame()
                 if head is not None:
                     video_writer_head.write(head)
-                if down is not None:
-                    video_writer_down.write(down)
                 elapsed = time.perf_counter() - t
                 time.sleep(max(0.0, interval - elapsed))
 
         threading.Thread(target=_record_frames, daemon=True).start()
         logger_mp.info(f"Recording video to {video_path}")
 
-        # ====================================================================
-        # OFT mode: background inference + temporal ensembling
-        # ====================================================================
-        if args.oft:
-            ensemble_buffer: list = []
-            buffer_lock = threading.Lock()
-            exec_step_ref = [0]
-            first_chunk_event = threading.Event()
+        ctx = zmq.Context()
+        socket = ctx.socket(zmq.REQ)
+        socket.connect(f"tcp://{args.server_host}:{args.server_port}")
+        socket.setsockopt(zmq.RCVTIMEO, 15000)
+        logger_mp.info(f"scale={action_scale} freq={args.frequency}Hz | task: '{args.task}'")
 
-            threading.Thread(
-                target=inference_worker,
-                args=(args.server_host, args.server_port, args.task,
-                      img_client, ensemble_buffer, buffer_lock,
-                      exec_step_ref, first_chunk_event, stop_event,
-                      args.chunk_size),
-                daemon=True,
-            ).start()
+        step = 0
+        last_no_frame_warn_t = 0.0
+        while True:
+            t0 = time.perf_counter()
+
+            policy_img, policy_src = get_policy_frame(img_client)
+            if policy_img is None:
+                now = time.time()
+                if now - last_no_frame_warn_t > 1.0:
+                    logger_mp.warning("Policy frame not ready — retrying.")
+                    last_no_frame_warn_t = now
+                time.sleep(0.02)
+                continue
+            img_b64 = encode_image_jpeg(policy_img)
+            try:
+                socket.send_json({"image": img_b64, "task": args.task})
+                resp = socket.recv_json()
+            except zmq.Again:
+                logger_mp.warning("Server timeout — skipping step.")
+                continue
+
+            if resp.get("status") != "ok":
+                logger_mp.warning(f"Server error: {resp.get('status')}")
+                continue
+
+            if "actions" in resp:
+                chunk = np.array(resp["actions"], dtype=np.float64)
+                action = chunk[0]
+            elif "action" in resp:
+                action = np.array(resp["action"], dtype=np.float64)
+                chunk = action[np.newaxis]
+            else:
+                logger_mp.warning("Server response missing action — skipping step.")
+                continue
+
+            L_ee, target_L, gripper_val = apply_action(
+                action, arm_ik, arm_ctrl, ee_shared_mem, action_scale
+            )
+            actual_positions.append(L_ee[:3, 3].copy())
+            planned_trajs.append(simulate_chunk_trajectory(L_ee, chunk, action_scale))
 
             logger_mp.info(
-                f"[OFT] chunk_size={args.chunk_size} lambda={args.ensemble_lambda} "
-                f"scale={args.action_scale} | task: '{args.task}'"
+                f"[step {step}] cam={policy_src} dz={action[2]:.4f} gripper={gripper_val:.2f} | "
+                f"L_pos {np.round(L_ee[:3,3],3)} -> {np.round(target_L[:3,3],3)} | "
+                f"ik={int((time.perf_counter()-t0)*1000)}ms"
             )
-            logger_mp.info("Waiting for first inference chunk ...")
-            if not first_chunk_event.wait(timeout=30.0):
-                logger_mp.error("Timed out waiting for inference server.")
-                return
-            logger_mp.info("First chunk received — starting execution loop.")
+            step += 1
 
-            step = 0
-            while True:
-                t0 = time.perf_counter()
-                with buffer_lock:
-                    exec_step_ref[0] = step
-                    action = temporal_ensemble(ensemble_buffer, step, args.ensemble_lambda)
-
-                if action is None:
-                    time.sleep(0.05)
-                    continue
-
-                L_ee, target_L, gripper_val = apply_action(
-                    action, arm_ik, arm_ctrl, ee_shared_mem, action_scale
-                )
-
-                with buffer_lock:
-                    n_chunks = len(ensemble_buffer)
-                logger_mp.info(
-                    f"[step {step}] dz={action[2]:.4f} gripper={gripper_val:.2f} | "
-                    f"L_pos {np.round(L_ee[:3,3],3)} -> {np.round(target_L[:3,3],3)} | "
-                    f"buf={n_chunks} | ik={int((time.perf_counter()-t0)*1000)}ms"
-                )
-                step += 1
-
-        # ====================================================================
-        # Standard OpenVLA mode: simple closed-loop, ZMQ in main thread
-        # ====================================================================
-        else:
-            ctx = zmq.Context()
-            socket = ctx.socket(zmq.REQ)
-            socket.connect(f"tcp://{args.server_host}:{args.server_port}")
-            socket.setsockopt(zmq.RCVTIMEO, 15000)
-            logger_mp.info(
-                f"[Standard] scale={action_scale} freq={args.frequency}Hz | "
-                f"task: '{args.task}'"
-            )
-
-            step = 0
-            while True:
-                t0 = time.perf_counter()
-
-                head_img, _ = img_client.get_head_frame()
-                down_img, _ = img_client.get_down_frame()
-                if head_img is None:
-                    logger_mp.warning("Head frame not ready — skipping step.")
-                    continue
-                img_b64 = encode_image_jpeg(head_img)
-                try:
-                    socket.send_json({"image": img_b64, "task": args.task})
-                    resp = socket.recv_json()
-                except zmq.Again:
-                    logger_mp.warning("Server timeout — skipping step.")
-                    continue
-
-                if resp.get("status") != "ok":
-                    logger_mp.warning(f"Server error: {resp.get('status')}")
-                    continue
-
-                if "action" in resp:
-                    action = np.array(resp["action"], dtype=np.float64)
-                elif "actions" in resp:
-                    action = np.array(resp["actions"][0], dtype=np.float64)
-                else:
-                    logger_mp.warning("Server response missing action — skipping step.")
-                    continue
-
-                L_ee, target_L, gripper_val = apply_action(
-                    action, arm_ik, arm_ctrl, ee_shared_mem, action_scale
-                )
-
-                logger_mp.info(
-                    f"[step {step}] dz={action[2]:.4f} gripper={gripper_val:.2f} | "
-                    f"L_pos {np.round(L_ee[:3,3],3)} -> {np.round(target_L[:3,3],3)} | "
-                    f"ik={int((time.perf_counter()-t0)*1000)}ms"
-                )
-                step += 1
-
-                elapsed = time.perf_counter() - t0
-                time.sleep(max(0.0, (1.0 / args.frequency) - elapsed))
+            elapsed = time.perf_counter() - t0
+            time.sleep(max(0.0, (1.0 / args.frequency) - elapsed))
 
     except KeyboardInterrupt:
         logger_mp.info("Interrupted by user.")
     except Exception:
         traceback.print_exc()
     finally:
-        stop_event.set()
         video_stop.set()
         if video_writer_head is not None:
             video_writer_head.release()
             logger_mp.info(f"Head video saved to {video_path.replace('.mp4', '_head.mp4')}")
-        if video_writer_down is not None:
-            video_writer_down.release()
-            logger_mp.info(f"Down video saved to {video_path.replace('.mp4', '_down.mp4')}")
+        if planned_trajs:
+            traj_plot_path = video_path.replace(".mp4", "_trajectories.png")
+            save_trajectory_plot(planned_trajs, actual_positions, traj_plot_path)
+            logger_mp.info(f"Trajectory plot saved to {traj_plot_path}")
         if img_client is not None:
             img_client.close()
         logger_mp.info("End of eval.")

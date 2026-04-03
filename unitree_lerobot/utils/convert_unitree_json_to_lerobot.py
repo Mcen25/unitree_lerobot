@@ -27,7 +27,7 @@ from collections import defaultdict
 from typing import Literal
 
 import pyarrow.parquet as pq
-from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import HfApi, CommitOperationAdd, hf_hub_download
 from lerobot.utils.constants import HF_LEROBOT_HOME
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -348,26 +348,30 @@ def json_to_lerobot(
 
 
 def _reupload_parquets(repo_id: str, root_path: Path) -> None:
-    """Re-upload all local parquet files directly via upload_file.
+    """Re-upload all local parquet files via create_commit with raw bytes.
 
-    upload_large_folder uses Xet chunked transfer which can corrupt small
-    parquet files. Uploading them again with upload_file fixes this.
+    upload_large_folder uses Xet chunked transfer which truncates parquet
+    files on download due to a bug in hf_xet. Using create_commit with raw
+    bytes forces proper LFS storage and guarantees correct round-trips.
     """
     hub_api = HfApi()
     parquet_files = sorted(root_path.glob("**/*.parquet"))
     if not parquet_files:
         return
-    print(f"Re-uploading {len(parquet_files)} parquet file(s) directly to avoid Xet corruption...")
+    print(f"Re-uploading {len(parquet_files)} parquet file(s) via create_commit (Xet bypass)...")
+    operations = []
     for local_path in parquet_files:
         rel = local_path.relative_to(root_path)
-        hub_api.upload_file(
-            path_or_fileobj=str(local_path),
-            path_in_repo=str(rel),
-            repo_id=repo_id,
-            repo_type="dataset",
-            commit_message=f"Re-upload {rel} via upload_file (Xet bypass)",
-        )
-        print(f"  uploaded: {rel}")
+        data = local_path.read_bytes()
+        operations.append(CommitOperationAdd(path_in_repo=str(rel), path_or_fileobj=data))
+        print(f"  queued: {rel} ({len(data):,} bytes)")
+    hub_api.create_commit(
+        repo_id=repo_id,
+        repo_type="dataset",
+        commit_message="Re-upload parquets via create_commit (Xet bypass)",
+        operations=operations,
+    )
+    print("  done.")
 
 
 def _verify_hub_parquets(repo_id: str, root_path: Path, max_retries: int = 3) -> None:

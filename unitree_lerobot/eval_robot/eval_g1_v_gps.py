@@ -4,9 +4,6 @@ V-GPS eval script for G1 robot with Inspire FTP gripper.
 Samples N actions from the OpenVLA server, scores them with a Cal-QL value
 function, and executes the highest-valued action on the real robot.
 
-Supports both standard V-GPS (closed-loop) and OpenVLA-OFT (chunking +
-temporal ensembling). V-GPS scoring only applies in standard mode.
-
 Usage (robot Jetson NX):
     conda activate unitree_lerobot
     cd /home/unitree/AlphaZ_WS/unitree_lerobot
@@ -36,6 +33,9 @@ import time
 import traceback
 
 import cv2
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pinocchio as pin
 import zmq
@@ -70,6 +70,57 @@ def apply_delta_ee(current_4x4: np.ndarray, delta_xyz: np.ndarray, delta_rpy: np
     target[:3, 3] += delta_xyz
     target[:3, :3] = rot_delta @ current_4x4[:3, :3]
     return target
+
+
+def simulate_chunk_trajectory(L_ee_start: np.ndarray, chunk: np.ndarray, action_scale: float) -> np.ndarray:
+    """Forward-simulate a chunk of delta actions. Returns (k+1, 3) xyz positions."""
+    poses = [L_ee_start[:3, 3].copy()]
+    pose = L_ee_start.copy()
+    for action in chunk:
+        physical = action.copy()
+        physical[:6] *= action_scale
+        pose = apply_delta_ee(pose, physical[:3], physical[3:6])
+        poses.append(pose[:3, 3].copy())
+    return np.array(poses)
+
+
+def save_trajectory_plot(
+    steps: list,          # list of (trajs, selected_idx) per step; selected_idx=-1 for no V-GPS
+    actual_positions: list,
+    out_path: str,
+):
+    """Save a 3D plot of VLA-planned trajectories.
+
+    Each entry in `steps` is (np.ndarray of shape (N, k+1, 3), selected_idx).
+    Non-selected candidates are drawn in gray; the selected one in the step's color.
+    """
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection="3d")
+
+    cmap = plt.get_cmap("cool")
+    n_steps = len(steps)
+    for i, (trajs, sel_idx) in enumerate(steps):
+        color = cmap(i / max(n_steps - 1, 1))
+        for j, traj in enumerate(trajs):
+            if sel_idx >= 0 and j != sel_idx:
+                ax.plot(traj[:, 0], traj[:, 1], traj[:, 2], color="gray", alpha=0.15, linewidth=0.8)
+            else:
+                ax.plot(traj[:, 0], traj[:, 1], traj[:, 2], color=color, alpha=0.7, linewidth=1.5)
+
+    if actual_positions:
+        actual = np.array(actual_positions)
+        ax.plot(actual[:, 0], actual[:, 1], actual[:, 2], "r-", linewidth=2, label="executed")
+        ax.scatter(*actual[0], color="green", s=50, zorder=5, label="start")
+        ax.scatter(*actual[-1], color="red", s=50, zorder=5, label="end")
+
+    ax.set_xlabel("X (m)")
+    ax.set_ylabel("Y (m)")
+    ax.set_zlabel("Z (m)")
+    ax.set_title(f"VLA planned trajectories ({n_steps} steps)")
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close(fig)
 
 
 def encode_image_jpeg(img_bgr: np.ndarray, quality: int = 85) -> str:
@@ -136,74 +187,6 @@ def load_vgps_checkpoint(path: str, wandb_run_name: str = ""):
     return get_values, critic_text_processor
 
 
-def temporal_ensemble(buffer: list, current_step: int, lam: float = 0.01) -> np.ndarray | None:
-    weighted = np.zeros(7)
-    total_w = 0.0
-    for chunk, pred_step in buffer:
-        idx = current_step - pred_step
-        if 0 <= idx < len(chunk):
-            w = np.exp(-lam * idx)
-            weighted += w * chunk[idx]
-            total_w += w
-    return weighted / total_w if total_w > 1e-9 else None
-
-
-def inference_worker(
-    server_host: str,
-    server_port: int,
-    task: str,
-    img_client: ImageClient,
-    buffer: list,
-    buffer_lock: threading.Lock,
-    exec_step_ref: list,
-    first_chunk_event: threading.Event,
-    stop_event: threading.Event,
-    max_buffer: int = 8,
-):
-    ctx = zmq.Context()
-    socket = ctx.socket(zmq.REQ)
-    socket.connect(f"tcp://{server_host}:{server_port}")
-    socket.setsockopt(zmq.RCVTIMEO, 15000)
-    logger_mp.info(f"[inference] Connected to {server_host}:{server_port}")
-
-    while not stop_event.is_set():
-        head_img, _ = img_client.get_head_frame()
-        if head_img is None:
-            time.sleep(0.01)
-            continue
-        img_b64 = encode_image_jpeg(head_img)
-        with buffer_lock:
-            pred_step = exec_step_ref[0]
-        try:
-            socket.send_json({"image": img_b64, "task": task})
-            resp = socket.recv_json()
-        except zmq.Again:
-            logger_mp.warning("[inference] Server timeout — retrying.")
-            continue
-
-        if resp.get("status") != "ok":
-            logger_mp.warning(f"[inference] Server error: {resp.get('status')}")
-            continue
-
-        if "actions" in resp:
-            chunk = np.array(resp["actions"], dtype=np.float64)
-        elif "action" in resp:
-            chunk = np.array([resp["action"]], dtype=np.float64)
-        else:
-            logger_mp.warning("[inference] Server response missing action — skipping.")
-            continue
-
-        with buffer_lock:
-            buffer.append((chunk, pred_step))
-            while len(buffer) > max_buffer:
-                buffer.pop(0)
-            first_chunk_event.set()
-
-    socket.close()
-    ctx.term()
-    logger_mp.info("[inference] Worker stopped.")
-
-
 def parse_args():
     p = argparse.ArgumentParser(description="V-GPS robot eval (robot side)")
     p.add_argument("--server-host", default="192.168.123.162")
@@ -227,12 +210,6 @@ def parse_args():
                    help="[V-GPS] Boltzmann temperature for action selection (0=argmax, default 1.0)")
     p.add_argument("--sample-temperature", type=float, default=1.5,
                    help="[V-GPS] OpenVLA sampling temperature for diversity (default 1.5)")
-    p.add_argument("--oft", action="store_true",
-                   help="Enable OFT mode: background inference thread + temporal ensembling")
-    p.add_argument("--chunk-size", type=int, default=8,
-                   help="[OFT] Action chunk size (match --num-actions-chunk on server)")
-    p.add_argument("--ensemble-lambda", type=float, default=0.01,
-                   help="[OFT] Temporal ensemble decay rate")
     p.add_argument("--frequency", type=float, default=5.0,
                    help="[Standard] Control frequency in Hz")
     p.add_argument("--send-real-robot", action="store_true")
@@ -287,10 +264,10 @@ def main():
     args = parse_args()
 
     video_writer_head = None
-    video_writer_down = None
     video_stop = threading.Event()
-    stop_event = threading.Event()
     img_client = None
+    traj_steps: list = []
+    actual_positions: list = []
     try:
         img_client = ImageClient(host=args.img_host, request_port=args.img_request_port)
         cam_config = img_client.get_cam_config()
@@ -351,194 +328,152 @@ def main():
             video_path.replace(".mp4", "_head.mp4"),
             cv2.VideoWriter_fourcc(*"mp4v"), 15, (640, 480),
         )
-        video_writer_down = cv2.VideoWriter(
-            video_path.replace(".mp4", "_down.mp4"),
-            cv2.VideoWriter_fourcc(*"mp4v"), 15, (640, 480),
-        )
 
         def _record_frames():
             interval = 1.0 / 15
             while not video_stop.is_set():
                 t = time.perf_counter()
                 head, _ = img_client.get_head_frame()
-                down, _ = img_client.get_down_frame()
                 if head is not None:
                     video_writer_head.write(head)
-                if down is not None:
-                    video_writer_down.write(down)
                 elapsed = time.perf_counter() - t
                 time.sleep(max(0.0, interval - elapsed))
 
         threading.Thread(target=_record_frames, daemon=True).start()
         logger_mp.info(f"Recording video to {video_path}")
 
-        if args.oft:
-            ensemble_buffer: list = []
-            buffer_lock = threading.Lock()
-            exec_step_ref = [0]
-            first_chunk_event = threading.Event()
+        import jax
+        ctx = zmq.Context()
+        socket = ctx.socket(zmq.REQ)
+        socket.connect(f"tcp://{args.server_host}:{args.server_port}")
+        socket.setsockopt(zmq.RCVTIMEO, 15000)
+        logger_mp.info(
+            f"[{'V-GPS' if args.use_vgps else 'Standard'}] "
+            f"scale={action_scale} freq={args.frequency}Hz | task: '{args.task}'"
+        )
 
-            threading.Thread(
-                target=inference_worker,
-                args=(args.server_host, args.server_port, args.task,
-                      img_client, ensemble_buffer, buffer_lock,
-                      exec_step_ref, first_chunk_event, stop_event,
-                      args.chunk_size),
-                daemon=True,
-            ).start()
+        step = 0
+        while True:
+            t0 = time.perf_counter()
 
-            logger_mp.info(
-                f"[OFT] chunk_size={args.chunk_size} lambda={args.ensemble_lambda} "
-                f"scale={action_scale} | task: '{args.task}'"
-            )
-            logger_mp.info("Waiting for first inference chunk ...")
-            if not first_chunk_event.wait(timeout=30.0):
-                logger_mp.error("Timed out waiting for inference server.")
-                return
-            logger_mp.info("First chunk received — starting execution loop.")
+            head_img, _ = img_client.get_head_frame()
+            if head_img is None:
+                logger_mp.warning("Head frame not ready — skipping step.")
+                continue
+            img_b64 = encode_image_jpeg(head_img)
 
-            step = 0
-            while True:
-                t0 = time.perf_counter()
-                with buffer_lock:
-                    exec_step_ref[0] = step
-                    action = temporal_ensemble(ensemble_buffer, step, args.ensemble_lambda)
-
-                if action is None:
-                    time.sleep(0.05)
+            if args.use_vgps:
+                try:
+                    socket.send_json({
+                        "image": img_b64,
+                        "task": args.task,
+                        "num_samples": args.num_samples,
+                        "sample_temperature": args.sample_temperature,
+                    })
+                    resp = socket.recv_json()
+                except zmq.Again:
+                    logger_mp.warning("Server timeout — skipping step.")
                     continue
 
-                L_ee, target_L, gripper_val = apply_action(
-                    action, arm_ik, arm_ctrl, ee_shared_mem, action_scale
-                )
-
-                with buffer_lock:
-                    n_chunks = len(ensemble_buffer)
-                logger_mp.info(
-                    f"[step {step}] dz={action[2]:.4f} gripper={gripper_val:.2f} | "
-                    f"L_pos {np.round(L_ee[:3,3],3)} -> {np.round(target_L[:3,3],3)} | "
-                    f"buf={n_chunks} | ik={int((time.perf_counter()-t0)*1000)}ms"
-                )
-                step += 1
-
-        else:
-            import jax
-            ctx = zmq.Context()
-            socket = ctx.socket(zmq.REQ)
-            socket.connect(f"tcp://{args.server_host}:{args.server_port}")
-            socket.setsockopt(zmq.RCVTIMEO, 15000)
-            logger_mp.info(
-                f"[Standard{'+ V-GPS' if args.use_vgps else ''}] "
-                f"scale={action_scale} freq={args.frequency}Hz | task: '{args.task}'"
-            )
-
-            step = 0
-            while True:
-                t0 = time.perf_counter()
-
-                head_img, _ = img_client.get_head_frame()
-                if head_img is None:
-                    logger_mp.warning("Head frame not ready — skipping step.")
+                if resp.get("status") != "ok":
+                    logger_mp.warning(f"Server error: {resp.get('status')}")
                     continue
-                img_b64 = encode_image_jpeg(head_img)
 
-                if args.use_vgps:
-                    try:
-                        socket.send_json({
-                            "image": img_b64,
-                            "task": args.task,
-                            "num_samples": args.num_samples,
-                            "sample_temperature": args.sample_temperature,
-                        })
-                        resp = socket.recv_json()
-                    except zmq.Again:
-                        logger_mp.warning("Server timeout — skipping step.")
-                        continue
+                if "actions" not in resp or resp["actions"] is None:
+                    logger_mp.warning("Server response missing actions — skipping step.")
+                    continue
 
-                    if resp.get("status") != "ok":
-                        logger_mp.warning(f"Server error: {resp.get('status')}")
-                        continue
+                candidate_actions = np.array(resp["actions"], dtype=np.float64)
+                n = len(candidate_actions)
 
-                    if "actions" not in resp or resp["actions"] is None:
-                        logger_mp.warning("Server response missing actions — skipping step.")
-                        continue
+                critic_image = cv2.resize(head_img, (256, 256))
+                critic_images = np.repeat(critic_image[None], n, axis=0)
+                prompt_embed = critic_text_processor.encode(args.task)
+                prompt_embeds = np.repeat(prompt_embed[None], n, axis=0)
+                critic_actions = rescale_actions(candidate_actions).astype(np.float32)
 
-                    candidate_actions = np.array(resp["actions"], dtype=np.float64)
-                    n = len(candidate_actions)
+                values = np.array(get_values(
+                    observations={"image": critic_images},
+                    goals={"language": prompt_embeds},
+                    actions=critic_actions,
+                ))
 
-                    critic_image = cv2.resize(head_img, (256, 256))
-                    critic_images = np.repeat(critic_image[None], n, axis=0)
-                    prompt_embed = critic_text_processor.encode(args.task)
-                    prompt_embeds = np.repeat(prompt_embed[None], n, axis=0)
-                    critic_actions = rescale_actions(candidate_actions).astype(np.float32)
-
-                    values = np.array(get_values(
-                        observations={"image": critic_images},
-                        goals={"language": prompt_embeds},
-                        actions=critic_actions,
-                    ))
-
-                    if args.action_temp > 0:
-                        rng = jax.random.PRNGKey(np.random.randint(0, 2**31))
-                        idx = int(jax.random.categorical(rng, values / args.action_temp))
-                    else:
-                        idx = int(np.argmax(values))
-                    action = candidate_actions[idx]
-
-                    logger_mp.info(
-                        f"[step {step}] V-GPS max={values.max():.2f} min={values.min():.2f} "
-                        f"selected={idx} | dz={action[2]:.4f} gripper={action[6]:.2f}"
-                    )
-
+                if args.action_temp > 0:
+                    rng = jax.random.PRNGKey(np.random.randint(0, 2**31))
+                    idx = int(jax.random.categorical(rng, values / args.action_temp))
                 else:
-                    try:
-                        socket.send_json({"image": img_b64, "task": args.task})
-                        resp = socket.recv_json()
-                    except zmq.Again:
-                        logger_mp.warning("Server timeout — skipping step.")
-                        continue
+                    idx = int(np.argmax(values))
+                action = candidate_actions[idx]
 
-                    if resp.get("status") != "ok":
-                        logger_mp.warning(f"Server error: {resp.get('status')}")
-                        continue
-
-                    if "action" in resp:
-                        action = np.array(resp["action"], dtype=np.float64)
-                    elif "actions" in resp:
-                        action = np.array(resp["actions"][0], dtype=np.float64)
-                    else:
-                        logger_mp.warning("Server response missing action — skipping step.")
-                        continue
-
-                    logger_mp.info(f"[step {step}] dz={action[2]:.4f} gripper={action[6]:.2f}")
+                logger_mp.info(
+                    f"[step {step}] V-GPS max={values.max():.2f} min={values.min():.2f} "
+                    f"selected={idx} | dz={action[2]:.4f} gripper={action[6]:.2f}"
+                )
 
                 L_ee, target_L, gripper_val = apply_action(
                     action, arm_ik, arm_ctrl, ee_shared_mem, action_scale
                 )
+                actual_positions.append(L_ee[:3, 3].copy())
+                # One 1-step trajectory per candidate; selected_idx marks the chosen one
+                candidate_trajs = np.array([
+                    simulate_chunk_trajectory(L_ee, a[np.newaxis], action_scale)
+                    for a in candidate_actions
+                ])
+                traj_steps.append((candidate_trajs, idx))
 
-                logger_mp.info(
-                    f"[step {step}] gripper_out={gripper_val:.2f} | "
-                    f"L_pos {np.round(L_ee[:3,3],3)} -> {np.round(target_L[:3,3],3)} | "
-                    f"ik={int((time.perf_counter()-t0)*1000)}ms"
+            else:
+                try:
+                    socket.send_json({"image": img_b64, "task": args.task})
+                    resp = socket.recv_json()
+                except zmq.Again:
+                    logger_mp.warning("Server timeout — skipping step.")
+                    continue
+
+                if resp.get("status") != "ok":
+                    logger_mp.warning(f"Server error: {resp.get('status')}")
+                    continue
+
+                if "actions" in resp:
+                    chunk = np.array(resp["actions"], dtype=np.float64)
+                    action = chunk[0]
+                elif "action" in resp:
+                    action = np.array(resp["action"], dtype=np.float64)
+                    chunk = action[np.newaxis]
+                else:
+                    logger_mp.warning("Server response missing action — skipping step.")
+                    continue
+
+                L_ee, target_L, gripper_val = apply_action(
+                    action, arm_ik, arm_ctrl, ee_shared_mem, action_scale
                 )
-                step += 1
+                actual_positions.append(L_ee[:3, 3].copy())
+                traj_steps.append((simulate_chunk_trajectory(L_ee, chunk, action_scale)[np.newaxis], -1))
 
-                elapsed = time.perf_counter() - t0
-                time.sleep(max(0.0, (1.0 / args.frequency) - elapsed))
+                logger_mp.info(f"[step {step}] dz={action[2]:.4f} gripper={action[6]:.2f}")
+
+            logger_mp.info(
+                f"[step {step}] gripper_out={gripper_val:.2f} | "
+                f"L_pos {np.round(L_ee[:3,3],3)} -> {np.round(target_L[:3,3],3)} | "
+                f"ik={int((time.perf_counter()-t0)*1000)}ms"
+            )
+            step += 1
+
+            elapsed = time.perf_counter() - t0
+            time.sleep(max(0.0, (1.0 / args.frequency) - elapsed))
 
     except KeyboardInterrupt:
         logger_mp.info("Interrupted by user.")
     except Exception:
         traceback.print_exc()
     finally:
-        stop_event.set()
         video_stop.set()
         if video_writer_head is not None:
             video_writer_head.release()
             logger_mp.info(f"Head video saved to {video_path.replace('.mp4', '_head.mp4')}")
-        if video_writer_down is not None:
-            video_writer_down.release()
-            logger_mp.info(f"Down video saved to {video_path.replace('.mp4', '_down.mp4')}")
+        if traj_steps:
+            traj_plot_path = video_path.replace(".mp4", "_trajectories.png")
+            save_trajectory_plot(traj_steps, actual_positions, traj_plot_path)
+            logger_mp.info(f"Trajectory plot saved to {traj_plot_path}")
         if img_client is not None:
             img_client.close()
         logger_mp.info("End of eval.")
