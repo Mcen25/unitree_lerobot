@@ -4,24 +4,29 @@ OpenVLA inference server with V-GPS multi-sample support.
 Supports three modes:
   Standard OpenVLA (default): token-based autoregressive prediction, returns single action.
   OpenVLA-OFT: action head (MLP) regression, returns full action chunk.
-  V-GPS: sample N actions with temperature for client-side Cal-QL value scoring.
+  V-GPS: sample N actions with temperature, score with Cal-QL, return best action.
 
 For V-GPS, the client sends {"image": ..., "task": ..., "num_samples": N, "sample_temperature": T}.
-The server returns {"actions": [[...], ...], "status": "ok"} with N 7-DOF action arrays.
+  - With --vgps-checkpoint: server scores N actions with Cal-QL and returns the best one as
+    {"action": [...], "status": "ok", "vgps_max": float, "vgps_min": float}.
+  - Without --vgps-checkpoint: returns all N actions as {"actions": [[...], ...], "status": "ok"}
+    for client-side scoring (backward compatible).
 
 Pass --no-action-head to force standard mode even if the checkpoint contains an action head.
 
-The checkpoint directory must contain:
+The OpenVLA checkpoint directory must contain:
   - model-*.safetensors / model.safetensors   merged model weights (OFT checkpoints)
   - dataset_statistics.json                   action normalization statistics
   - [OFT only] action_head--*_checkpoint.pt   L1RegressionActionHead weights
   - [OFT only] modeling_prismatic.py          OFT model code (trust_remote_code)
 
-Usage (Jetson Thor):
+Usage (server with Cal-QL scoring):
     conda activate <env>
     python openvla_server_v_gps.py \\
         --checkpoint /path/to/openvla-7b+pick_up_bottle_1+... \\
         --no-action-head \\
+        --vgps-checkpoint /path/to/calql_checkpoint_500000 \\
+        --vgps-root /path/to/V-GPS \\
         --port 5555
 
 Notes for Jetson Thor (aarch64):
@@ -184,6 +189,17 @@ def parse_args():
                    help="[Legacy] Directory to cache a LoRA-merged model.")
     p.add_argument("--clear-cache", action="store_true",
                    help="[Legacy] Delete merged model cache and re-merge.")
+    # V-GPS server-side Cal-QL scoring
+    p.add_argument("--vgps-checkpoint", default="",
+                   help="Path to Cal-QL checkpoint directory for server-side V-GPS scoring. "
+                        "When set, N sampled actions are scored and the best is returned.")
+    p.add_argument("--vgps-wandb", default="",
+                   help="Wandb run name for Cal-QL config ('' uses pretrained_checkpoint.yaml)")
+    p.add_argument("--vgps-root", default="",
+                   help="Path to the V-GPS repo root (needed to import jaxrl_m). "
+                        "Defaults to the directory two levels above --vgps-checkpoint.")
+    p.add_argument("--vgps-action-temp", type=float, default=1.0,
+                   help="Boltzmann temperature for V-GPS action selection (0=argmax, default 1.0)")
     return p.parse_args()
 
 
@@ -466,6 +482,73 @@ def run_inference(
 
 
 # ---------------------------------------------------------------------------
+# Cal-QL value function (V-GPS)
+# ---------------------------------------------------------------------------
+
+_BRIDGE_ACT_MIN = np.array([-0.05, -0.05, -0.05, -0.25, -0.25, -0.25, 0.0])
+_BRIDGE_ACT_MAX = np.array([ 0.05,  0.05,  0.05,  0.25,  0.25,  0.25, 1.0])
+
+
+def _rescale_actions(actions: np.ndarray, safety_margin: float = 1e-5) -> np.ndarray:
+    scaled = (actions - _BRIDGE_ACT_MIN) / (_BRIDGE_ACT_MAX - _BRIDGE_ACT_MIN) * 2 - 1
+    return np.clip(scaled, -1 + safety_margin, 1 - safety_margin)
+
+
+def load_vgps_checkpoint(checkpoint_path: str, vgps_root: str, wandb_run_name: str = ""):
+    """Load Cal-QL agent from a V-GPS checkpoint. Returns (get_values, text_processor)."""
+    assert os.path.exists(checkpoint_path), f"V-GPS checkpoint not found: {checkpoint_path}"
+
+    if not vgps_root:
+        # Default: two levels up from checkpoint (e.g. .../V-GPS/checkpoints/ckpt_500000 -> .../V-GPS)
+        vgps_root = os.path.dirname(os.path.dirname(os.path.abspath(checkpoint_path)))
+
+    openvla_root = os.path.join(os.path.dirname(vgps_root), "openvla")
+    for p in [vgps_root, openvla_root]:
+        if os.path.isdir(p) and p not in sys.path:
+            sys.path.insert(0, p)
+
+    import jax
+    import yaml
+    from flax.training import checkpoints
+    from jaxrl_m.agents import agents
+    from jaxrl_m.vision import encoders
+    from jaxrl_m.data.text_processing import text_processors
+
+    os.environ.setdefault("TFHUB_CACHE_DIR", "/tmp/tfhub")
+
+    pretrained_config_path = os.path.join(vgps_root, "experiments/configs/pretrained_checkpoint.yaml")
+    if wandb_run_name:
+        import wandb
+        config = wandb.Api().run(wandb_run_name).config
+    else:
+        with open(pretrained_config_path) as f:
+            config = yaml.safe_load(f)
+
+    encoder_def = encoders[config["encoder"]](**config["encoder_kwargs"])
+    example_batch = {
+        "observations": {"image": np.zeros((1, 256, 256, 3), dtype=np.uint8)},
+        "goals":        {"language": np.zeros((1, 512), dtype=np.float32)},
+        "actions":      np.zeros((1, 7), dtype=np.float32),
+    }
+    agent = agents[config["agent"]].create(
+        rng=jax.random.PRNGKey(0),
+        encoder_def=encoder_def,
+        observations=example_batch["observations"],
+        goals=example_batch["goals"],
+        actions=example_batch["actions"],
+        **config["agent_kwargs"],
+    )
+    critic_text_processor = text_processors[config["text_processor"]]()
+    agent = checkpoints.restore_checkpoint(checkpoint_path, agent)
+
+    def get_values(observations, goals, actions):
+        return agent.get_q_values(observations, goals, actions)
+
+    print(f"[server] V-GPS Cal-QL loaded from {checkpoint_path}")
+    return get_values, critic_text_processor
+
+
+# ---------------------------------------------------------------------------
 # Main server loop
 # ---------------------------------------------------------------------------
 
@@ -501,13 +584,20 @@ def main():
     else:
         print("[server] Standard OpenVLA mode (token-based prediction).")
 
+    # Optional Cal-QL value function for server-side V-GPS scoring
+    get_values = None
+    critic_text_processor = None
+    prompt_embed_cache: dict = {}  # task string -> (N, 512) array
+    if args.vgps_checkpoint:
+        get_values, critic_text_processor = load_vgps_checkpoint(
+            args.vgps_checkpoint, args.vgps_root, args.vgps_wandb
+        )
+        print(f"[server] V-GPS scoring enabled | action_temp={args.vgps_action_temp}")
+
     ctx = zmq.Context()
     socket = ctx.socket(zmq.REP)
     socket.bind(f"tcp://0.0.0.0:{args.port}")
     print(f"[server] Listening on port {args.port} ...")
-
-    # Chunk management and temporal ensembling are now handled client-side.
-    # The server always runs a fresh inference and returns the full chunk.
 
     step = 0
     while True:
@@ -525,7 +615,7 @@ def main():
                     print(f"[server] step={step} | action={np.round(chunk[0], 4)}")
                 socket.send_json({"actions": chunk, "status": "ok"})
             elif num_samples > 1:
-                # V-GPS: sample N actions with temperature for client-side value scoring
+                # Sample N actions with temperature
                 inputs_no_mask = _prepare_inputs(model, processor, image, task, device)
                 sampled = []
                 import torch
@@ -536,9 +626,51 @@ def main():
                         if hasattr(a, "cpu"):
                             a = a.cpu().numpy()
                         sampled.append([float(x) for x in np.atleast_1d(a).flatten()[:7]])
-                if step % 20 == 0:
-                    print(f"[server] step={step} | V-GPS {num_samples} samples | first={np.round(sampled[0], 4)}")
-                socket.send_json({"actions": sampled, "status": "ok"})
+
+                if get_values is not None:
+                    # Server-side Cal-QL scoring: score and return the best action
+                    import jax
+                    candidate_actions = np.array(sampled, dtype=np.float64)
+                    critic_image = np.array(image.resize((256, 256)), dtype=np.uint8)
+                    critic_images = np.repeat(critic_image[None], num_samples, axis=0)
+                    critic_actions = _rescale_actions(candidate_actions).astype(np.float32)
+
+                    if task not in prompt_embed_cache:
+                        _embed = critic_text_processor.encode(task)
+                        prompt_embed_cache[task] = np.repeat(_embed, num_samples, axis=0)
+                    elif prompt_embed_cache[task].shape[0] != num_samples:
+                        _embed = prompt_embed_cache[task][:1]
+                        prompt_embed_cache[task] = np.repeat(_embed, num_samples, axis=0)
+
+                    values = np.array(get_values(
+                        observations={"image": critic_images},
+                        goals={"language": prompt_embed_cache[task]},
+                        actions=critic_actions,
+                    ))
+                    if args.vgps_action_temp > 0:
+                        rng = jax.random.PRNGKey(np.random.randint(0, 2**31))
+                        idx = int(jax.random.categorical(rng, values / args.vgps_action_temp))
+                    else:
+                        idx = int(np.argmax(values))
+
+                    best_action = sampled[idx]
+                    if step % 5 == 0:
+                        print(
+                            f"[server] step={step} | V-GPS max={values.max():.2f} "
+                            f"min={values.min():.2f} selected={idx} | "
+                            f"dz={best_action[2]:.4f} gripper={best_action[6]:.2f}"
+                        )
+                    socket.send_json({
+                        "action": best_action,
+                        "status": "ok",
+                        "vgps_max": float(values.max()),
+                        "vgps_min": float(values.min()),
+                    })
+                else:
+                    # No Cal-QL: return all N actions for client-side scoring
+                    if step % 20 == 0:
+                        print(f"[server] step={step} | V-GPS {num_samples} samples | first={np.round(sampled[0], 4)}")
+                    socket.send_json({"actions": sampled, "status": "ok"})
             else:
                 # Standard OpenVLA: return single action
                 chunk = run_inference(model, processor, action_head, image, task, unnorm_key, device)

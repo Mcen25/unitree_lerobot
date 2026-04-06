@@ -503,8 +503,8 @@ G1_INSPIRE_LEFT_ARM_CONFIG = RobotConfig(
         "ee_yaw",
         "ee_gripper",
     ],
-    cameras=["cam_high", "cam_down"],
-    camera_to_image_key={"color_0": "cam_high", "color_3": "cam_down"},
+    cameras=["cam_high"],
+    camera_to_image_key={"color_0": "cam_high"},
     json_state_data_name=["left_ee_abs.qpos"],
     json_action_data_name=["left_ee_delta.qpos"],
 )

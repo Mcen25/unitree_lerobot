@@ -1,14 +1,22 @@
 """
 V-GPS eval script for G1 robot with Inspire FTP gripper.
 
-Samples N actions from the OpenVLA server, scores them with a Cal-QL value
-function, and executes the highest-valued action on the real robot.
+Samples N actions from the OpenVLA server and either:
+  - Has the server score and select the best action (server-side V-GPS, recommended),
+  - Or scores locally with a Cal-QL value function (client-side V-GPS, requires JAX).
 
 Usage (robot Jetson NX):
     conda activate unitree_lerobot
     cd /home/unitree/AlphaZ_WS/unitree_lerobot
 
-    # Standard OpenVLA with V-GPS:
+    # V-GPS with server-side Cal-QL scoring (no JAX needed on Jetson):
+    python unitree_lerobot/eval_robot/eval_g1_v_gps.py \\
+        --server-host 100.96.139.69 --server-port 5555 \\
+        --task "pick up the orange bottle and put it in the black box" \\
+        --use-vgps --num-samples 10 \\
+        --action-scale 4.0 --send-real-robot --motion
+
+    # V-GPS with client-side Cal-QL scoring (requires JAX CUDA on Jetson):
     python unitree_lerobot/eval_robot/eval_g1_v_gps.py \\
         --server-host 100.96.139.69 --server-port 5555 \\
         --task "pick up the orange bottle and put it in the black box" \\
@@ -201,7 +209,8 @@ def parse_args():
     p.add_argument("--use-vgps", action="store_true",
                    help="Enable V-GPS: sample N actions and score with Cal-QL value function")
     p.add_argument("--vgps-checkpoint", default="",
-                   help="Path to Cal-QL checkpoint directory")
+                   help="Path to Cal-QL checkpoint for client-side scoring. "
+                        "Leave empty to use server-side scoring (requires --vgps-checkpoint on server).")
     p.add_argument("--vgps-wandb", default="",
                    help="Wandb run name for checkpoint config (or '' to use pretrained_checkpoint.yaml)")
     p.add_argument("--num-samples", type=int, default=10,
@@ -251,7 +260,7 @@ def apply_action(action, arm_ik, arm_ctrl, ee_shared_mem, action_scale):
     sol_tau[7:] = 0.0
     arm_ctrl.ctrl_dual_arm(sol_q, sol_tau)
     gripper_val = float(np.clip(physical[6] * 2.0, 0.0, 1.0))
-    if gripper_val < 0.9:
+    if gripper_val < 0.7:
         gripper_val = 0.0
     if ee_shared_mem:
         left_mem = ee_shared_mem.get("left")
@@ -302,15 +311,27 @@ def main():
 
         get_values = None
         critic_text_processor = None
+        prompt_embeds_cache = None
+        vgps_client_side = False
         if args.use_vgps:
-            assert args.vgps_checkpoint != "", "Must set --vgps-checkpoint when using --use-vgps"
-            get_values, critic_text_processor = load_vgps_checkpoint(
-                args.vgps_checkpoint, args.vgps_wandb
-            )
-            logger_mp.info(
-                f"[V-GPS] Ready | num_samples={args.num_samples} "
-                f"action_temp={args.action_temp} sample_temp={args.sample_temperature}"
-            )
+            if args.vgps_checkpoint:
+                # Client-side Cal-QL scoring (requires JAX on Jetson)
+                get_values, critic_text_processor = load_vgps_checkpoint(
+                    args.vgps_checkpoint, args.vgps_wandb
+                )
+                _prompt_embed = critic_text_processor.encode(args.task)
+                prompt_embeds_cache = np.repeat(_prompt_embed, args.num_samples, axis=0)
+                vgps_client_side = True
+                logger_mp.info(
+                    f"[V-GPS] Client-side scoring | num_samples={args.num_samples} "
+                    f"action_temp={args.action_temp} sample_temp={args.sample_temperature}"
+                )
+            else:
+                # Server-side scoring — server must be started with --vgps-checkpoint
+                logger_mp.info(
+                    f"[V-GPS] Server-side scoring | num_samples={args.num_samples} "
+                    f"sample_temp={args.sample_temperature}"
+                )
 
         time.sleep(1.0)
         _frame0, _ = img_client.get_head_frame()
@@ -342,7 +363,8 @@ def main():
         threading.Thread(target=_record_frames, daemon=True).start()
         logger_mp.info(f"Recording video to {video_path}")
 
-        import jax
+        if vgps_client_side:
+            import jax
         ctx = zmq.Context()
         socket = ctx.socket(zmq.REQ)
         socket.connect(f"tcp://{args.server_host}:{args.server_port}")
@@ -379,47 +401,65 @@ def main():
                     logger_mp.warning(f"Server error: {resp.get('status')}")
                     continue
 
-                if "actions" not in resp or resp["actions"] is None:
-                    logger_mp.warning("Server response missing actions — skipping step.")
-                    continue
+                if vgps_client_side:
+                    # Client-side scoring: server returns all N candidate actions
+                    if "actions" not in resp or resp["actions"] is None:
+                        logger_mp.warning("Server response missing actions — skipping step.")
+                        continue
 
-                candidate_actions = np.array(resp["actions"], dtype=np.float64)
-                n = len(candidate_actions)
-
-                critic_image = cv2.resize(head_img, (256, 256))
-                critic_images = np.repeat(critic_image[None], n, axis=0)
-                prompt_embed = critic_text_processor.encode(args.task)
-                prompt_embeds = np.repeat(prompt_embed[None], n, axis=0)
-                critic_actions = rescale_actions(candidate_actions).astype(np.float32)
-
-                values = np.array(get_values(
-                    observations={"image": critic_images},
-                    goals={"language": prompt_embeds},
-                    actions=critic_actions,
-                ))
-
-                if args.action_temp > 0:
-                    rng = jax.random.PRNGKey(np.random.randint(0, 2**31))
-                    idx = int(jax.random.categorical(rng, values / args.action_temp))
+                    candidate_actions = np.array(resp["actions"], dtype=np.float64)
+                    n = len(candidate_actions)
+                    critic_image = cv2.resize(head_img, (256, 256))
+                    critic_images = np.repeat(critic_image[None], n, axis=0)
+                    critic_actions = rescale_actions(candidate_actions).astype(np.float32)
+                    values = np.array(get_values(
+                        observations={"image": critic_images},
+                        goals={"language": prompt_embeds_cache},
+                        actions=critic_actions,
+                    ))
+                    if args.action_temp > 0:
+                        rng = jax.random.PRNGKey(np.random.randint(0, 2**31))
+                        idx = int(jax.random.categorical(rng, values / args.action_temp))
+                    else:
+                        idx = int(np.argmax(values))
+                    action = candidate_actions[idx]
+                    logger_mp.info(
+                        f"[step {step}] V-GPS (client) max={values.max():.2f} min={values.min():.2f} "
+                        f"selected={idx} | dz={action[2]:.4f} gripper={action[6]:.2f}"
+                    )
+                    # Trajectory visualization uses the EE pose before the action is applied.
+                    # L_ee is available after apply_action; simulate from current IK state.
+                    _current_q = arm_ctrl.get_current_dual_arm_q()
+                    _L_ee_now, _ = get_current_ee_poses(arm_ik, _current_q)
+                    candidate_trajs = np.array([
+                        simulate_chunk_trajectory(_L_ee_now, a[np.newaxis], action_scale)
+                        for a in candidate_actions
+                    ])
                 else:
-                    idx = int(np.argmax(values))
-                action = candidate_actions[idx]
+                    # Server-side scoring: server returns the single best action
+                    if "action" not in resp or resp["action"] is None:
+                        logger_mp.warning("Server response missing action — skipping step.")
+                        continue
 
-                logger_mp.info(
-                    f"[step {step}] V-GPS max={values.max():.2f} min={values.min():.2f} "
-                    f"selected={idx} | dz={action[2]:.4f} gripper={action[6]:.2f}"
-                )
+                    action = np.array(resp["action"], dtype=np.float64)
+                    vgps_max = resp.get("vgps_max", float("nan"))
+                    vgps_min = resp.get("vgps_min", float("nan"))
+                    logger_mp.info(
+                        f"[step {step}] V-GPS (server) max={vgps_max:.2f} min={vgps_min:.2f} "
+                        f"| dz={action[2]:.4f} gripper={action[6]:.2f}"
+                    )
+                    candidate_trajs = None
 
                 L_ee, target_L, gripper_val = apply_action(
                     action, arm_ik, arm_ctrl, ee_shared_mem, action_scale
                 )
                 actual_positions.append(L_ee[:3, 3].copy())
-                # One 1-step trajectory per candidate; selected_idx marks the chosen one
-                candidate_trajs = np.array([
-                    simulate_chunk_trajectory(L_ee, a[np.newaxis], action_scale)
-                    for a in candidate_actions
-                ])
-                traj_steps.append((candidate_trajs, idx))
+                if candidate_trajs is not None:
+                    traj_steps.append((candidate_trajs, idx))
+                else:
+                    traj_steps.append((
+                        simulate_chunk_trajectory(L_ee, action[np.newaxis], action_scale)[np.newaxis], -1
+                    ))
 
             else:
                 try:
