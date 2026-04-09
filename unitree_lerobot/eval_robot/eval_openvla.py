@@ -19,6 +19,7 @@ Usage (robot Jetson NX):
 import argparse
 import base64
 import os
+import queue
 import threading
 import time
 import traceback
@@ -38,6 +39,7 @@ logger_mp = logging_mp.get_logger(__name__)
 
 from teleimager.image_client import ImageClient
 from unitree_lerobot.eval_robot.make_robot import setup_robot_interface
+from unitree_lerobot.eval_robot.utils.weighted_moving_filter import WeightedMovingFilter
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +139,8 @@ def parse_args():
     p.add_argument("--ee", default="inspire_ftp")
     p.add_argument("--action-scale", type=float, default=None,
                    help="Multiply xyz+rpy deltas by this factor. Defaults to training-fps/eval-fps "
-                        "to compensate for frequency mismatch.")
+                        "to compensate for frequency mismatch. Use --action-scale 8.0 if IK "
+                        "takes ~400ms (effective ~2.5Hz vs 10Hz training).")
     p.add_argument("--training-fps", type=float, default=10.0,
                    help="FPS the model was trained at (default 10). Used to compute default action-scale.")
     p.add_argument("--frequency", type=float, default=5.0,
@@ -159,53 +162,72 @@ def parse_args():
 # ---------------------------------------------------------------------------
 
 _HOME_Q = np.array([
-    # left arm (7 DOF) — pick_up_bottle episode_0001 frame 120 (arm extended forward, ee_x=0.328m)
-    -0.4393416941165924,
-     0.09620936214923859,
-     0.05770404636859894,
-     0.6954206228256226,
-    -0.09713214635848999,
-    -0.4131801426410675,
-    -0.3374398350715637,
+    # left arm (7 DOF) — episode_0000 frame 0 actions (verified correct)
+    -0.05145166757245604,
+     0.17305626571607208,
+     0.2541934344164593,
+     0.6125124396585253,
+    -0.19589794340621144,
+    -0.7380041987558164,
+    -0.30302244941880885,
     # right arm (7 DOF)
-    -0.28895166516304016,
-    -0.01605886220932007,
-    -0.2118811011314392,
-     1.3727091550827026,
-    -0.08853945881128311,
-    -0.05060938373208046,
-     0.04924318194389343,
+     0.03721101954579353,
+    -0.10063154250383377,
+    -0.034023214131593704,
+     1.1916035413742065,
+    -0.04767324775457382,
+    -0.00794554129242897,
+    -0.01378185860812664,
 ])
 
 
 
-def apply_action(action, arm_ik, arm_ctrl, ee_shared_mem, action_scale):
+def apply_action(action, arm_ik, arm_ctrl, ee_shared_mem, action_scale,
+                 prev_sol_q: np.ndarray = None):
     """FK → apply delta → IK → send to robot + gripper.
 
     The server (openvla_server.py) fully denormalizes actions to physical space
     using BOUNDS_Q99 stats before sending. action_scale compensates for the
     training-fps / eval-fps mismatch (e.g. trained at 10Hz, eval at 5Hz → scale=2).
     Gripper (dim 6) is NOT scaled — it is already in [0, 0.5] physical range.
+
+    prev_sol_q: the IK solution from the previous step. When provided, FK is
+    computed from the previous commanded position (not the sensor reading) and
+    the IK is warm-started from it. This prevents the 1-step sensor lag from
+    shifting the delta target each step.
     """
     physical = action.copy()
     physical[:6] *= action_scale
 
     current_arm_q = arm_ctrl.get_current_dual_arm_q()
-    L_ee, R_ee = get_current_ee_poses(arm_ik, current_arm_q)
-    target_L = apply_delta_ee(L_ee, physical[:3], physical[3:6])
-    sol_q, sol_tau = arm_ik.solve_ik(target_L, R_ee, current_arm_q)
+
+    if prev_sol_q is not None:
+        # Use FK of the previous IK solution as the delta base.
+        # The sensor lags the commanded position by ~1 step (100ms at 10Hz);
+        # applying the delta to FK(sensor) would offset the target by that lag.
+        L_ee, R_ee = get_current_ee_poses(arm_ik, prev_sol_q)
+        target_L = apply_delta_ee(L_ee, physical[:3], physical[3:6])
+        sol_q, _ = arm_ik.solve_ik(target_L, R_ee, prev_sol_q)
+    else:
+        L_ee, R_ee = get_current_ee_poses(arm_ik, current_arm_q)
+        target_L = apply_delta_ee(L_ee, physical[:3], physical[3:6])
+        sol_q, _ = arm_ik.solve_ik(target_L, R_ee, current_arm_q)
+
     sol_q[7:] = current_arm_q[7:]
-    sol_tau[7:] = 0.0
+    # Recompute gravity torques for the actual sol_q (left IK result + right held at current).
+    # The IK's sol_tau is stale after we override sol_q[7:], and zeroing it would drop
+    # right-arm gravity compensation causing the right arm to droop.
+    nv = arm_ik.reduced_robot.model.nv
+    sol_tau = pin.rnea(arm_ik.reduced_robot.model, arm_ik.reduced_robot.data,
+                       sol_q, np.zeros(nv), np.zeros(nv))
     arm_ctrl.ctrl_dual_arm(sol_q, sol_tau)
     # Training gripper range 0–0.5, controller expects 0–1
     gripper_val = float(np.clip(physical[6] * 2.0, 0.0, 1.0))
-    if gripper_val < 0.7:
-        gripper_val = 0.0
     if ee_shared_mem:
         left_mem = ee_shared_mem.get("left")
         if left_mem is not None and hasattr(left_mem, "value"):
             left_mem.value = gripper_val
-    return L_ee, target_L, gripper_val
+    return L_ee, target_L, gripper_val, sol_q
 
 
 # ---------------------------------------------------------------------------
@@ -233,14 +255,26 @@ def main():
         arm_ik   = robot_interface["arm_ik"]
         ee_shared_mem = robot_interface["ee_shared_mem"]
 
+        # Replace the IK smooth filter with an identity filter.
+        # The default [0.4, 0.3, 0.2, 0.1] filter attenuates the first IK
+        # solve to 40% and introduces ~3-4 step lag.  Each IK result is now
+        # applied in full immediately, matching the quality of joint replay.
+        arm_ik.smooth_filter = WeightedMovingFilter(np.array([1.0]), 14)
+
         # -- Move to home position --------------------------------------------
         current_q = arm_ctrl.get_current_dual_arm_q()
         logger_mp.info(f"Moving arm to home position: {np.round(_HOME_Q, 3)}")
+        nv = arm_ik.reduced_robot.model.nv
         for i in range(1, 201):
             interp_q = current_q + (_HOME_Q - current_q) * (i / 200)
-            arm_ctrl.ctrl_dual_arm(interp_q, np.zeros(len(interp_q)))
+            tau = pin.rnea(arm_ik.reduced_robot.model, arm_ik.reduced_robot.data,
+                           interp_q, np.zeros(nv), np.zeros(nv))
+            arm_ctrl.ctrl_dual_arm(interp_q, tau)
             time.sleep(0.01)
         logger_mp.info("Arm ready.")
+        # Seed the delta-base with the home position joints.
+        # apply_action will update this each step with the IK solution.
+        prev_sol_q = _HOME_Q.copy()
 
         # -- Open gripper at start -------------------------------------------
         if ee_shared_mem:
@@ -256,7 +290,6 @@ def main():
 
         action_scale = args.action_scale if args.action_scale is not None else args.training_fps / args.frequency
         logger_mp.info(f"action_scale={action_scale:.2f} (training {args.training_fps}Hz / eval {args.frequency}Hz)")
-        # gripper_filter = GripperHysteresis()
 
         time.sleep(0.5)
         frame0, frame0_src = None, None
@@ -303,50 +336,89 @@ def main():
         socket.setsockopt(zmq.RCVTIMEO, 15000)
         logger_mp.info(f"scale={action_scale} freq={args.frequency}Hz | task: '{args.task}'")
 
+        # ------------------------------------------------------------------
+        # Inference thread: camera → VLA server → action queue
+        # Runs concurrently with IK so ZMQ round-trip doesn't block the
+        # IK/control loop.  Queue size=2: always keep the freshest action,
+        # drop stale ones so IK never operates on old observations.
+        # ------------------------------------------------------------------
+        action_q: queue.Queue = queue.Queue(maxsize=2)
+
+        def _inference_loop():
+            last_no_frame_warn_t = 0.0
+            while not video_stop.is_set():
+                policy_img, policy_src = get_policy_frame(img_client)
+                if policy_img is None:
+                    now = time.time()
+                    if now - last_no_frame_warn_t > 1.0:
+                        logger_mp.warning("Policy frame not ready — retrying.")
+                        last_no_frame_warn_t = now
+                    time.sleep(0.02)
+                    continue
+                img_b64 = encode_image_jpeg(policy_img)
+                try:
+                    socket.send_json({"image": img_b64, "task": args.task})
+                    resp = socket.recv_json()
+                except zmq.Again:
+                    logger_mp.warning("Server timeout — skipping step.")
+                    continue
+                except zmq.ZMQError as e:
+                    logger_mp.error(f"ZMQ error: {e} — skipping step.")
+                    continue
+
+                if resp.get("status") != "ok":
+                    logger_mp.warning(f"Server error: {resp.get('status')}")
+                    continue
+
+                if "actions" in resp:
+                    chunk = np.array(resp["actions"], dtype=np.float64)
+                    action = chunk[0]
+                elif "action" in resp:
+                    action = np.array(resp["action"], dtype=np.float64)
+                    chunk = action[np.newaxis]
+                else:
+                    logger_mp.warning("Server response missing action — skipping step.")
+                    continue
+
+                # Drop stale action if IK hasn't caught up; keep only freshest.
+                while action_q.full():
+                    try:
+                        action_q.get_nowait()
+                    except queue.Empty:
+                        break
+                action_q.put((policy_src, action, chunk))
+
+        threading.Thread(target=_inference_loop, daemon=True, name="inference").start()
+
+        # ------------------------------------------------------------------
+        # IK / control loop — runs at IK rate (~1/ik_ms Hz).
+        # ZMQ is fully decoupled: inference thread fills the queue while
+        # IK is solving, so the next action is usually ready immediately.
+        # ------------------------------------------------------------------
         step = 0
-        last_no_frame_warn_t = 0.0
         while True:
             t0 = time.perf_counter()
 
-            policy_img, policy_src = get_policy_frame(img_client)
-            if policy_img is None:
-                now = time.time()
-                if now - last_no_frame_warn_t > 1.0:
-                    logger_mp.warning("Policy frame not ready — retrying.")
-                    last_no_frame_warn_t = now
-                time.sleep(0.02)
-                continue
-            img_b64 = encode_image_jpeg(policy_img)
             try:
-                socket.send_json({"image": img_b64, "task": args.task})
-                resp = socket.recv_json()
-            except zmq.Again:
-                logger_mp.warning("Server timeout — skipping step.")
-                continue
+                policy_src, action, chunk = action_q.get(timeout=20.0)
+            except queue.Empty:
+                logger_mp.warning("No action received in 20 s — stopping.")
+                break
 
-            if resp.get("status") != "ok":
-                logger_mp.warning(f"Server error: {resp.get('status')}")
-                continue
-
-            if "actions" in resp:
-                chunk = np.array(resp["actions"], dtype=np.float64)
-                action = chunk[0]
-            elif "action" in resp:
-                action = np.array(resp["action"], dtype=np.float64)
-                chunk = action[np.newaxis]
-            else:
-                logger_mp.warning("Server response missing action — skipping step.")
-                continue
-
-            L_ee, target_L, gripper_val = apply_action(
-                action, arm_ik, arm_ctrl, ee_shared_mem, action_scale
+            L_ee, target_L, gripper_val, prev_sol_q = apply_action(
+                action, arm_ik, arm_ctrl, ee_shared_mem, action_scale,
+                prev_sol_q=prev_sol_q,
             )
             actual_positions.append(L_ee[:3, 3].copy())
             planned_trajs.append(simulate_chunk_trajectory(L_ee, chunk, action_scale))
 
             logger_mp.info(
-                f"[step {step}] cam={policy_src} dz={action[2]:.4f} gripper={gripper_val:.2f} | "
+                f"[step {step}] cam={policy_src} "
+                f"dxyz={np.round(action[:3]*action_scale,4)} "
+                f"drpy={np.round(action[3:6]*action_scale,4)} "
+                f"grip={gripper_val:.2f} | "
                 f"L_pos {np.round(L_ee[:3,3],3)} -> {np.round(target_L[:3,3],3)} | "
+                f"L_rpy {np.round(pin.rpy.matrixToRpy(L_ee[:3,:3]),3)} -> {np.round(pin.rpy.matrixToRpy(target_L[:3,:3]),3)} | "
                 f"ik={int((time.perf_counter()-t0)*1000)}ms"
             )
             step += 1

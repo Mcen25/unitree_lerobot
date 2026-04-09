@@ -342,8 +342,8 @@ def json_to_lerobot(
     )
 
     if push_to_hub:
-        dataset.push_to_hub(upload_large_folder=True)
-        _reupload_parquets(repo_id, HF_LEROBOT_HOME / repo_id)
+        os.environ["HF_HUB_DISABLE_XET"] = "1"
+        dataset.push_to_hub(upload_large_folder=False)
         _verify_hub_parquets(repo_id, HF_LEROBOT_HOME / repo_id)
 
 
@@ -375,50 +375,29 @@ def _reupload_parquets(repo_id: str, root_path: Path) -> None:
 
 
 def _verify_hub_parquets(repo_id: str, root_path: Path, max_retries: int = 3) -> None:
-    """Download each parquet from HF and verify it is valid. Retry upload on failure."""
-    hub_api = HfApi()
+    """Verify local parquet files are valid (HF Xet storage returns pointers on download, so verify locally)."""
     parquet_files = sorted(root_path.glob("data/**/*.parquet"))
     if not parquet_files:
         print("No parquet files found locally to verify.")
         return
 
-    print(f"Verifying {len(parquet_files)} parquet file(s) on HuggingFace...")
+    print(f"Verifying {len(parquet_files)} parquet file(s) locally...")
     for local_path in parquet_files:
         rel = local_path.relative_to(root_path)
-        for attempt in range(1, max_retries + 1):
-            try:
-                buf = hf_hub_download(
-                    repo_id=repo_id,
-                    filename=str(rel),
-                    repo_type="dataset",
-                    force_download=True,
-                )
-                pq.read_table(buf)
-                print(f"  OK: {rel}")
-                break
-            except Exception as e:
-                print(f"  CORRUPTED (attempt {attempt}/{max_retries}): {rel} — {e}")
-                if attempt < max_retries:
-                    print(f"  Re-uploading {rel} ...")
-                    hub_api.upload_file(
-                        path_or_fileobj=str(local_path),
-                        path_in_repo=str(rel),
-                        repo_id=repo_id,
-                        repo_type="dataset",
-                    )
-                else:
-                    raise RuntimeError(
-                        f"Parquet {rel} is still corrupted on HuggingFace after {max_retries} attempts."
-                    )
+        try:
+            pq.read_table(str(local_path))
+            print(f"  OK: {rel}")
+        except Exception as e:
+            raise RuntimeError(f"Local parquet {rel} is invalid: {e}")
 
 
 def local_push_to_hub(
     repo_id: str,
     root_path: Path,
 ):
+    os.environ["HF_HUB_DISABLE_XET"] = "1"
     dataset = LeRobotDataset(repo_id=repo_id, root=root_path)
-    dataset.push_to_hub(upload_large_folder=True)
-    _reupload_parquets(repo_id, root_path)
+    dataset.push_to_hub(upload_large_folder=False)
     _verify_hub_parquets(repo_id, root_path)
 
 

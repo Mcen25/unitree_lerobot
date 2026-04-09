@@ -151,7 +151,8 @@ class G1_29_ArmIK:
         )
 
         opts = {
-            "ipopt": {"print_level": 0, "max_iter": 50, "tol": 1e-6},
+            "ipopt": {"print_level": 0, "max_iter": 20, "tol": 1e-4,
+                      "acceptable_tol": 1e-4, "acceptable_iter": 3},
             "print_time": False,  # print or not
             "calc_lam_p": False,  # https://github.com/casadi/casadi/wiki/FAQ:-Why-am-I-getting-%22NaN-detected%22in-my-optimization%3F
         }

@@ -163,6 +163,7 @@ def process_episode(
         poses_R.append(T_R)
 
     # Pass 2: compute deltas + absolute poses, write into each frame
+    n = len(frames)
     for i, frame in enumerate(frames):
         l_grip = frame["actions"]["left_ee"]["qpos"][:1] if frame["actions"]["left_ee"]["qpos"] else [0.0]
 
@@ -172,7 +173,9 @@ def process_episode(
         frame["states"]["left_ee_abs"] = {"qpos": abs_L.tolist()}
 
         # Delta action: [Δx, Δy, Δz, Δroll, Δpitch, Δyaw, gripper]
-        d_L = np.zeros(6) if i == 0 else se3_delta(poses_L[i - 1], poses_L[i])
+        # action[i] = delta from pose[i] to pose[i+1] (where to move next from the current observation)
+        # Last frame gets zero delta (episode ends, no future motion).
+        d_L = se3_delta(poses_L[i], poses_L[i + 1]) if i < n - 1 else np.zeros(6)
         frame["actions"]["left_ee_delta"] = {"qpos": np.concatenate([d_L, l_grip]).tolist()}
 
         if not left_only:
@@ -180,7 +183,7 @@ def process_episode(
             T_R = poses_R[i]
             abs_R = np.concatenate([T_R.translation, pin.rpy.matrixToRpy(T_R.rotation), r_grip])
             frame["states"]["right_ee_abs"] = {"qpos": abs_R.tolist()}
-            d_R = np.zeros(6) if i == 0 else se3_delta(poses_R[i - 1], poses_R[i])
+            d_R = se3_delta(poses_R[i], poses_R[i + 1]) if i < n - 1 else np.zeros(6)
             frame["actions"]["right_ee_delta"] = {"qpos": np.concatenate([d_R, r_grip]).tolist()}
 
     # Update episode: replace data list and record new fps
